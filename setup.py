@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
         'sim_editor_reactive_controller = ratsim_ros2.sim_editor_reactive_controller:main',
+        'play_ratsim_bag = ratsim_ros2.play_ratsim_bag :main',
     ],
     },
 )

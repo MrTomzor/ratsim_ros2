@@ -47,7 +47,7 @@ def convert_twist2d_to_odometry(msg: Twist2DMessage, sim_time: float) -> Odometr
     odom = Odometry()
     odom.header = Header()
     odom.header.stamp = create_ros_time(sim_time)
-    odom.header.frame_id = "world"
+    odom.header.frame_id = "odom"
     odom.child_frame_id = "base_link"
 
     # Set pose from the sim's forward (x), left (y), and clockwise rotation (yaw)

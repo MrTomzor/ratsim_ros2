@@ -5,9 +5,11 @@ from ratsim.nav.navsim import NavSim
 from ratsim.roslike_unity_connector.connector import *
 from ratsim.roslike_unity_connector.message_definitions import *
 from ratsim.nav.reactive_controller import *
+from ratsim.roslike_unity_connector.bag import MessageBag
 
 from ratsim_ros2.conversions import *
 from rosgraph_msgs.msg import Clock
+import sys
 
 import rclpy
 from rclpy.node import Node
@@ -15,30 +17,30 @@ from rclpy.node import Node
 class MyNode(Node):
     def __init__(self):
         super().__init__('my_node')
-        self.get_logger().info('Hello from my_node!')
-
+        save_filename = sys.argv[1]
+        rate = float(sys.argv[2]) if len(sys.argv) == 3 else 1
+        self.get_logger().info('Opening ratbag file: ' + save_filename )
 
         # Add ROS2 publishers for Odometry and LaserScan and time
         pub_odom = self.create_publisher(Odometry, '/odom', 10)
         pub_lidar = self.create_publisher(LaserScan, '/scan', 10)
         pub_time = self.create_publisher(Clock, '/clock', 1)
 
-        sim = NavSim()
-        
-        # First step
-        last_obsv, done = sim.step()
-
-        reactive_controller = ReactiveController(2, 4, 1, 0.5, dist_threshold1=3, dist_threshold2=5, ignore_colored=True) 
-
         deltatime = 0.1
         step_idx = 0
-        start_walltime = time.time()
-        
-        while True:
-            simtime = step_idx * deltatime
 
-            lidarmsg = last_obsv["/lidar2d"][0]
-            gt_pose_msg = last_obsv["/rat1_pose"][0]
+        bag = MessageBag(save_filename)
+        
+        print("num steps:", len(bag.steps))
+        rate = rate / deltatime
+        walltime_target_dt = 1.0 / rate
+        
+        for i, step in enumerate(bag.steps):
+            stepstarttime = time.time()
+            simtime = i * deltatime
+
+            lidarmsg = step["/lidar2d"][0]
+            gt_pose_msg = step["/rat1_pose"][0]
 
             # Convert Lidar2DMessage to LaserScan
             ros_odom_msg = convert_twist2d_to_odometry(gt_pose_msg, simtime)
@@ -53,15 +55,14 @@ class MyNode(Node):
             pub_odom.publish(ros_odom_msg)
             pub_lidar.publish(ros_lidar_msg)
 
-            # Get reac controller output and apply
-            twistmsg = reactive_controller.step(last_obsv)
-            last_obsv, done = sim.step({"/cmd_vel": [twistmsg]})
+            walltime_elapsed = time.time() - stepstarttime
+            # Wait for the remaining time to match the target rate
+            if walltime_elapsed < walltime_target_dt:
+                time.sleep(walltime_target_dt - walltime_elapsed)
 
-            print("Publishing twist message:", twistmsg.forward, twistmsg.left, twistmsg.radiansCounterClockwise)
-            print("Simtime: " + str(simtime) + ", Walltime: " + str(time.time() - start_walltime))
-            sim.conn.log_connection_stats()
+            print(f"Published step {i+1}/{len(bag.steps)}: simtime={simtime:.2f}s")
 
-            step_idx += 1
+        print("Finished publishing all steps.")
 
 def main(args=None):
     rclpy.init(args=args)
