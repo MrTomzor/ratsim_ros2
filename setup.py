@@ -25,6 +25,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-        ],
+        'sim_editor_reactive_controller = ratsim_ros2.sim_editor_reactive_controller:main',
+    ],
     },
 )
