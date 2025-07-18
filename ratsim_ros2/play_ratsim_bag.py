@@ -48,10 +48,12 @@ class MyNode(Node):
             simtime = i * deltatime
 
             lidarmsg = step["/lidar2d"][0]
-            gt_pose_msg = step["/rat1_pose"][0]
+            gt_odom_topic = "/rat1_pose"
+            noised_odom_topic = "/rat1_pose_noised"
+            pose_msg = step[gt_odom_topic][0] if not noised_odom_topic in step else step[noised_odom_topic][0]
 
             # Convert Lidar2DMessage to LaserScan
-            ros_odom_msg = convert_twist2d_to_odometry(gt_pose_msg, simtime)
+            ros_odom_msg = convert_twist2d_to_odometry(pose_msg, simtime)
             # Convert odom to ROS odom msg
             ros_lidar_msg = convert_lidar2d_to_laserscan(lidarmsg, simtime)
             # Publish ROS time 
