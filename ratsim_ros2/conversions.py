@@ -56,9 +56,7 @@ def convert_twist2d_to_odometry(msg: Twist2DMessage, sim_time: float) -> Odometr
     pose.pose.position.y = msg.left
     pose.pose.position.z = 0.0
 
-    # Convert clockwise rotation to counter-clockwise yaw for ROS standard
-    # The sim uses clockwise, ROS uses counter-clockwise positive yaw
-    yaw = -msg.radiansCounterClockwise
+    yaw = msg.radiansCounterClockwise
     pose.pose.orientation = quaternion_from_yaw(yaw)
 
     odom.pose = pose

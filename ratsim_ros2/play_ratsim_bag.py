@@ -17,9 +17,17 @@ from rclpy.node import Node
 class MyNode(Node):
     def __init__(self):
         super().__init__('my_node')
-        save_filename = sys.argv[1]
-        rate = float(sys.argv[2]) if len(sys.argv) == 3 else 1
-        self.get_logger().info('Opening ratbag file: ' + save_filename )
+        # save_filename = sys.argv[1]
+        # rate = float(sys.argv[2]) if len(sys.argv) == 3 else 1
+        # self.get_logger().info('Opening ratbag file: ' + save_filename )
+
+        self.declare_parameter('dataset_path', '')
+        self.declare_parameter('rate', 1.0)
+
+        save_filename = self.get_parameter('dataset_path').get_parameter_value().string_value
+        rate = self.get_parameter('rate').get_parameter_value().double_value
+
+        self.get_logger().info(f'Opening ratbag file: {save_filename} at rate: {rate}')
 
         # Add ROS2 publishers for Odometry and LaserScan and time
         pub_odom = self.create_publisher(Odometry, '/odom', 10)
@@ -31,7 +39,7 @@ class MyNode(Node):
 
         bag = MessageBag(save_filename)
         
-        print("num steps:", len(bag.steps))
+        self.get_logger().info("num steps:" + str(len(bag.steps)))
         rate = rate / deltatime
         walltime_target_dt = 1.0 / rate
         
@@ -60,9 +68,9 @@ class MyNode(Node):
             if walltime_elapsed < walltime_target_dt:
                 time.sleep(walltime_target_dt - walltime_elapsed)
 
-            print(f"Published step {i+1}/{len(bag.steps)}: simtime={simtime:.2f}s")
+            self.get_logger().info(f"Published step {i+1}/{len(bag.steps)}: simtime={simtime:.2f}s")
 
-        print("Finished publishing all steps.")
+        self.get_logger().info("Finished publishing all steps.")
 
 def main(args=None):
     rclpy.init(args=args)
