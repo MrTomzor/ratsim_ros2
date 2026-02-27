@@ -41,7 +41,7 @@ class MyNode(Node):
             gt_pose_msg = last_obsv["/rat1_pose"][0]
 
             # Convert Lidar2DMessage to LaserScan
-            ros_odom_msg = convert_twist2d_to_odometry(gt_pose_msg, simtime)
+            ros_odom_msg = convert_pose_to_odometry(gt_pose_msg, simtime)
             # Convert odom to ROS odom msg
             ros_lidar_msg = convert_lidar2d_to_laserscan(lidarmsg, simtime)
             # Publish ROS time 
@@ -57,7 +57,7 @@ class MyNode(Node):
             twistmsg = reactive_controller.step(last_obsv)
             last_obsv, done = sim.step({"/cmd_vel": [twistmsg]})
 
-            print("Publishing twist message:", twistmsg.forward, twistmsg.left, twistmsg.radiansCounterClockwise)
+            print("Publishing twist message:", twistmsg.linear_x, twistmsg.linear_y, twistmsg.angular_z)
             print("Simtime: " + str(simtime) + ", Walltime: " + str(time.time() - start_walltime))
             sim.conn.log_connection_stats()
 
