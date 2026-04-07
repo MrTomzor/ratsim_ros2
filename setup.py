@@ -26,7 +26,9 @@ setup(
     entry_points={
         'console_scripts': [
         'sim_editor_reactive_controller = ratsim_ros2.sim_editor_reactive_controller:main',
-        'play_ratsim_bag = ratsim_ros2.play_ratsim_bag :main',
+        'play_ratsim_bag = ratsim_ros2.play_ratsim_bag:main',
+        'unity_ros2_bridge = ratsim_ros2.unity_ros2_bridge:main',
+        'foraging_explorer = ratsim_ros2.foraging_explorer:main',
     ],
     },
 )
