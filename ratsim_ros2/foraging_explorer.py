@@ -2,9 +2,14 @@
 """Foraging exploration node.
 
 Pure ROS2 node (no ratsim dependency) that builds an occupancy map from
-lidar, detects frontiers, plans paths with A*, and follows them.  When a
-reward object is detected via semantic lidar descriptors, the agent switches
-to COLLECT mode and approaches the reward.
+lidar, detects frontiers, plans paths with A*, and follows them using
+pure-pursuit (carrot-on-a-stick) path following.  When a reward object is
+detected via semantic lidar descriptors, the agent switches to COLLECT
+mode and approaches the reward.
+
+Architecture: two timers run at different rates:
+  - Planning timer (~0.5Hz): frontier detection, clustering, A* path planning
+  - Control timer (~50Hz): pure-pursuit path following / reward approach
 
 Subscribed topics:
     /scan              (sensor_msgs/LaserScan)
@@ -56,16 +61,14 @@ class ForagingExplorer(Node):
         self.declare_parameter("reward_descriptor_index", 2)
         self.declare_parameter("descriptor_dimension", 3)
         self.declare_parameter("max_linear_vel", 10.0)
-        self.declare_parameter("max_angular_vel", 1.5)
-        self.declare_parameter("collect_approach_dist", 2.0)
+        self.declare_parameter("max_angular_vel", 2.0)
         self.declare_parameter("frontier_min_size", 5)
         self.declare_parameter("obstacle_slowdown_dist", 5.0)
-        self.declare_parameter("lookahead_dist", 3.0)
-        self.declare_parameter("waypoint_reached_dist", 2.0)
-        self.declare_parameter("replan_interval", 5.0)  # seconds
+        self.declare_parameter("lookahead_dist", 5.0)
+        self.declare_parameter("replan_interval", 2.0)     # seconds
         self.declare_parameter("map_publish_interval", 0.5)  # seconds
         self.declare_parameter("safety_dist", 1.5)
-        self.declare_parameter("angular_gain", 2.0)
+        self.declare_parameter("control_rate", 50.0)       # Hz
 
         self.grid_resolution = self.get_parameter("grid_resolution").value
         self.inflation_radius = self.get_parameter("inflation_radius").value
@@ -73,15 +76,13 @@ class ForagingExplorer(Node):
         self.desc_dim = self.get_parameter("descriptor_dimension").value
         self.max_linear_vel = self.get_parameter("max_linear_vel").value
         self.max_angular_vel = self.get_parameter("max_angular_vel").value
-        self.collect_approach_dist = self.get_parameter("collect_approach_dist").value
         self.frontier_min_size = self.get_parameter("frontier_min_size").value
         self.obstacle_slowdown_dist = self.get_parameter("obstacle_slowdown_dist").value
         self.lookahead_dist = self.get_parameter("lookahead_dist").value
-        self.waypoint_reached_dist = self.get_parameter("waypoint_reached_dist").value
         self.replan_interval = self.get_parameter("replan_interval").value
         self.map_publish_interval = self.get_parameter("map_publish_interval").value
         self.safety_dist = self.get_parameter("safety_dist").value
-        self.angular_gain = self.get_parameter("angular_gain").value
+        control_rate = self.get_parameter("control_rate").value
 
         # -- State --
         self.state = State.WAITING
@@ -94,6 +95,7 @@ class ForagingExplorer(Node):
         self.path_idx = 0
         self.last_replan_time = 0.0
         self.last_map_publish_time = 0.0
+        self._replan_requested = False
 
         # Reward detection
         self.reward_visible = False
@@ -127,11 +129,19 @@ class ForagingExplorer(Node):
         self.pub_plan = self.create_publisher(Path, "/plan", 10)
         self.pub_frontiers = self.create_publisher(MarkerArray, "/frontiers", 10)
         self.pub_goal = self.create_publisher(Marker, "/goal_marker", 10)
+        self.pub_carrot = self.create_publisher(Marker, "/carrot_marker", 10)
 
-        # -- Control loop timer (runs at ~10Hz but actual rate depends on sim) --
-        self.create_timer(0.1, self._control_loop)
+        # -- Fast timer: pure-pursuit path following --
+        self.create_timer(1.0 / control_rate, self._control_loop)
 
-        self.get_logger().info("ForagingExplorer node started, waiting for world bounds...")
+        # -- Slow timer: frontier detection + A* planning --
+        self.create_timer(self.replan_interval, self._planning_loop)
+
+        self.get_logger().info(
+            f"ForagingExplorer started: control={control_rate}Hz, "
+            f"replan_interval={self.replan_interval}s, "
+            f"lookahead={self.lookahead_dist}m"
+        )
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -155,16 +165,19 @@ class ForagingExplorer(Node):
         self.current_path = []
         self.path_idx = 0
         self.state = State.EXPLORE
+        self._replan_requested = True
         self.get_logger().info(
             f"Initialized grid: {self.grid.cells_x}x{self.grid.cells_y} cells "
             f"at {self.grid_resolution}m resolution -> state=EXPLORE"
         )
 
     def _episode_active_cb(self, msg: Bool):
-        self.get_logger().info(f"episode_active={msg.data}, state={self.state.name}, grid={'yes' if self.grid else 'no'}")
+        self.get_logger().info(
+            f"episode_active={msg.data}, state={self.state.name}, "
+            f"grid={'yes' if self.grid else 'no'}"
+        )
         if msg.data:
             if self.grid is not None:
-                # New episode — clear and restart
                 self.get_logger().info("New episode detected, resetting explorer state.")
                 self.grid.clear()
                 self.current_path = []
@@ -172,11 +185,12 @@ class ForagingExplorer(Node):
                 self.reward_visible = False
                 self.has_pose = False
                 self.state = State.EXPLORE
+                self._replan_requested = True
             else:
-                # No grid yet — world_bounds not received.  Stay waiting.
-                self.get_logger().warn("Episode active but no grid yet (world_bounds not received).")
+                self.get_logger().warn(
+                    "Episode active but no grid yet (world_bounds not received)."
+                )
         else:
-            # Episode ended
             if self.state != State.WAITING:
                 self.get_logger().info("Episode ended -> WAITING")
             self.state = State.WAITING
@@ -187,14 +201,13 @@ class ForagingExplorer(Node):
         self.agent_x = msg.pose.pose.position.x
         self.agent_y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
-        # yaw from quaternion (z-up convention)
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.agent_yaw = math.atan2(siny_cosp, cosy_cosp)
         self.has_pose = True
         if not prev_has_pose:
             self.get_logger().info(
-                f"First pose received: x={self.agent_x:.1f}, y={self.agent_y:.1f}, "
+                f"First pose: x={self.agent_x:.1f}, y={self.agent_y:.1f}, "
                 f"yaw={math.degrees(self.agent_yaw):.1f}deg"
             )
 
@@ -203,12 +216,11 @@ class ForagingExplorer(Node):
         if self.grid is None or not self.has_pose:
             return
 
-        n_rays = len(msg.ranges)
-        valid_rays = sum(1 for r in msg.ranges if r > 0 and r < msg.range_max)
-
         # Log first scan
         if not hasattr(self, '_first_scan_logged'):
             self._first_scan_logged = True
+            n_rays = len(msg.ranges)
+            valid_rays = sum(1 for r in msg.ranges if r > 0 and r < msg.range_max)
             self.get_logger().info(
                 f"First scan: {n_rays} rays, {valid_rays} valid, "
                 f"angle_min={math.degrees(msg.angle_min):.1f}, "
@@ -216,12 +228,11 @@ class ForagingExplorer(Node):
                 f"range_max={msg.range_max:.1f}"
             )
 
-        ranges = list(msg.ranges)
         self.grid.update_from_lidar(
             agent_x=self.agent_x,
             agent_y=self.agent_y,
             agent_yaw=self.agent_yaw,
-            ranges=ranges,
+            ranges=list(msg.ranges),
             angle_start_rad=msg.angle_min,
             angle_increment_rad=msg.angle_increment,
             max_range=msg.range_max,
@@ -235,11 +246,7 @@ class ForagingExplorer(Node):
 
     def _semantic_cb(self, msg: Float32MultiArray):
         """Check semantic lidar for reward objects."""
-        if not msg.data:
-            self.reward_visible = False
-            return
-
-        if self.latest_scan is None:
+        if not msg.data or self.latest_scan is None:
             self.reward_visible = False
             return
 
@@ -251,13 +258,13 @@ class ForagingExplorer(Node):
             self.reward_visible = False
             return
 
-        # Auto-detect descriptor dimension from scan ray count
+        # Auto-detect descriptor dimension
         if len(descriptors) % n_rays != 0:
             if not hasattr(self, '_desc_mismatch_logged'):
                 self._desc_mismatch_logged = True
                 self.get_logger().warn(
                     f"Descriptor length {len(descriptors)} not divisible by "
-                    f"n_rays {n_rays}, skipping semantic processing"
+                    f"n_rays {n_rays}, skipping"
                 )
             self.reward_visible = False
             return
@@ -282,20 +289,13 @@ class ForagingExplorer(Node):
             self.reward_visible = False
             return
 
-        # The bridge publishes raw descriptors from Unity's Lidar2DMessage.
-        # The LaserScan ranges are reversed (ROS CCW convention), but the
-        # semantic descriptors arrive in Unity's original order (CW from
-        # angleStartDeg).  To align them we reverse the descriptor array
-        # per-ray so it matches the reversed ranges in LaserScan.
+        # Reverse descriptor array to match LaserScan ray order
         desc_array = np.array(descriptors).reshape(n_rays, self.desc_dim)
-        desc_array = desc_array[::-1]  # reverse to match LaserScan order
+        desc_array = desc_array[::-1]
 
         ranges = np.array(scan.ranges)
 
-        # Find rays where the reward descriptor index is active
         reward_mask = desc_array[:, self.reward_desc_idx] > 0.5
-
-        # Also require the range to be a valid hit (not max range / no hit)
         valid_range = (ranges > 0) & (ranges < scan.range_max * 0.99)
         reward_hits = reward_mask & valid_range
 
@@ -303,185 +303,31 @@ class ForagingExplorer(Node):
             self.reward_visible = False
             return
 
-        # Compute bearing to reward rays (in agent-local frame)
         reward_indices = np.where(reward_hits)[0]
         bearings = scan.angle_min + reward_indices * scan.angle_increment
         distances = ranges[reward_indices]
 
-        # Weighted average bearing (closer = higher weight)
         weights = 1.0 / (distances + 0.1)
         self.reward_bearing = float(np.average(bearings, weights=weights))
         self.reward_distance = float(np.min(distances))
         self.reward_visible = True
 
     # ------------------------------------------------------------------
-    # Control loop
+    # Planning loop (slow timer)
     # ------------------------------------------------------------------
 
-    def _control_loop(self):
-        if self.state == State.WAITING or not self.has_pose or self.grid is None:
-            # Log why we're not acting (throttled)
-            if not hasattr(self, '_ctrl_wait_counter'):
-                self._ctrl_wait_counter = 0
-            self._ctrl_wait_counter += 1
-            if self._ctrl_wait_counter % 50 == 1:
-                # Check how many publishers exist on topics we subscribe to
-                n_scan = self.count_publishers("/scan")
-                n_odom = self.count_publishers("/odom")
-                n_wb = self.count_publishers("/world_bounds")
-                n_ea = self.count_publishers("/episode_active")
-                self.get_logger().info(
-                    f"Control loop waiting: state={self.state.name}, "
-                    f"has_pose={self.has_pose}, grid={'yes' if self.grid else 'no'}, "
-                    f"pubs: scan={n_scan}, odom={n_odom}, "
-                    f"world_bounds={n_wb}, episode_active={n_ea}"
-                )
+    def _planning_loop(self):
+        """Runs at low frequency: detect frontiers, plan A* path."""
+        if self.state not in (State.EXPLORE, State.COLLECT):
+            return
+        if not self.has_pose or self.grid is None:
             return
 
-        # Log first active tick
-        if not hasattr(self, '_first_ctrl_logged'):
-            self._first_ctrl_logged = True
-            self.get_logger().info(
-                f"Control loop active! state={self.state.name}, "
-                f"pos=({self.agent_x:.1f}, {self.agent_y:.1f})"
-            )
-
-        # -- Check for reward objects (transition to COLLECT) --
-        if self.reward_visible and self.state == State.EXPLORE:
-            self.state = State.COLLECT
-            self.get_logger().info(
-                f"Reward spotted! bearing={math.degrees(self.reward_bearing):.1f}deg "
-                f"dist={self.reward_distance:.1f}m -> COLLECT"
-            )
-
+        # In COLLECT state, don't replan frontiers — just follow reward
         if self.state == State.COLLECT:
-            self._do_collect()
-        elif self.state == State.EXPLORE:
-            self._do_explore()
-
-    def _do_collect(self):
-        """Turn toward reward and approach it."""
-        if not self.reward_visible:
-            self.get_logger().info("Reward no longer visible -> EXPLORE")
-            self.state = State.EXPLORE
-            self.current_path = []  # force replan
             return
 
-        # Proportional rotation toward reward bearing
-        angle_error = self.reward_bearing  # already in agent-local frame
-        angular_z = self._clamp(
-            self.angular_gain * angle_error, -self.max_angular_vel, self.max_angular_vel
-        )
-
-        # Forward speed: reduce when not aligned, stop if obstacle too close
-        alignment = max(0.0, math.cos(angle_error))
-        linear_x = self.max_linear_vel * alignment
-
-        # Obstacle check in forward cone
-        min_front_range = self._get_min_front_range()
-        if min_front_range < self.safety_dist:
-            linear_x = 0.0
-            # Still rotate toward reward
-        elif min_front_range < self.obstacle_slowdown_dist:
-            slow_factor = (min_front_range - self.safety_dist) / (
-                self.obstacle_slowdown_dist - self.safety_dist
-            )
-            linear_x *= slow_factor
-
-        self._publish_vel(linear_x, angular_z)
-
-        # Publish goal marker at estimated reward position
-        reward_wx = self.agent_x + self.reward_distance * math.cos(
-            self.agent_yaw + self.reward_bearing
-        )
-        reward_wy = self.agent_y + self.reward_distance * math.sin(
-            self.agent_yaw + self.reward_bearing
-        )
-        self._publish_goal_marker(reward_wx, reward_wy, r=1.0, g=0.8, b=0.0)
-
-    def _do_explore(self):
-        """Frontier-based exploration with A* path following."""
-        now = time.monotonic()
-
-        # Check if we need to replan
-        need_replan = False
-        if not self.current_path:
-            need_replan = True
-        elif self.path_idx >= len(self.current_path):
-            need_replan = True
-        elif now - self.last_replan_time > self.replan_interval:
-            need_replan = True
-
-        if need_replan:
-            self.get_logger().info("Replanning...")
-            self._plan_to_frontier()
-            self.last_replan_time = now
-
-        if not self.current_path:
-            # No frontiers — nothing to explore
-            self._publish_zero_vel()
-            return
-
-        # Advance path_idx past waypoints we've already reached
-        while self.path_idx < len(self.current_path):
-            wx, wy = self.current_path[self.path_idx]
-            dist = math.hypot(wx - self.agent_x, wy - self.agent_y)
-            if dist < self.waypoint_reached_dist:
-                self.path_idx += 1
-            else:
-                break
-
-        if self.path_idx >= len(self.current_path):
-            # Reached end of path — will replan next tick
-            self._publish_zero_vel()
-            return
-
-        # Pure pursuit: steer toward lookahead point on path
-        target_x, target_y = self._get_lookahead_point()
-
-        # Compute angle to target in world frame, then error relative to heading
-        dx = target_x - self.agent_x
-        dy = target_y - self.agent_y
-        target_angle = math.atan2(dy, dx)
-        angle_error = self._normalize_angle(target_angle - self.agent_yaw)
-
-        angular_z = self._clamp(
-            self.angular_gain * angle_error, -self.max_angular_vel, self.max_angular_vel
-        )
-
-        # Forward speed: proportional to alignment
-        alignment = max(0.0, math.cos(angle_error))
-        linear_x = self.max_linear_vel * alignment
-
-        # Obstacle slowdown
-        min_front_range = self._get_min_front_range()
-        if min_front_range < self.safety_dist:
-            linear_x = 0.0
-            # Rotate in place to find a clear direction
-            if abs(angle_error) < 0.3:
-                angular_z = self.max_angular_vel  # turn away
-        elif min_front_range < self.obstacle_slowdown_dist:
-            slow_factor = (min_front_range - self.safety_dist) / (
-                self.obstacle_slowdown_dist - self.safety_dist
-            )
-            linear_x *= slow_factor
-
-        # Log velocity commands periodically
-        if not hasattr(self, '_vel_log_counter'):
-            self._vel_log_counter = 0
-        self._vel_log_counter += 1
-        if self._vel_log_counter % 20 == 1:
-            self.get_logger().info(
-                f"EXPLORE vel: lin={linear_x:.2f}, ang={angular_z:.2f}, "
-                f"target=({target_x:.1f},{target_y:.1f}), "
-                f"pos=({self.agent_x:.1f},{self.agent_y:.1f}), "
-                f"yaw={math.degrees(self.agent_yaw):.1f}deg, "
-                f"angle_err={math.degrees(angle_error):.1f}deg, "
-                f"path_idx={self.path_idx}/{len(self.current_path)}, "
-                f"front_range={min_front_range:.1f}"
-            )
-
-        self._publish_vel(linear_x, angular_z)
+        self._plan_to_frontier()
 
     def _plan_to_frontier(self):
         """Find frontiers, pick closest, plan A* path."""
@@ -528,7 +374,6 @@ class ForagingExplorer(Node):
                 f"A* failed to frontier at ({goal_x:.0f}, {goal_y:.0f}), "
                 f"trying next cluster..."
             )
-            # Try other clusters
             for cluster in clusters:
                 if cluster is best_cluster:
                     continue
@@ -547,41 +392,198 @@ class ForagingExplorer(Node):
             self.current_path = []
             return
 
-        # Simplify path: skip waypoints that are very close together
-        simplified = [path[0]]
-        for wp in path[1:]:
-            if math.hypot(wp[0] - simplified[-1][0], wp[1] - simplified[-1][1]) > self.grid_resolution * 2:
-                simplified.append(wp)
-        if simplified[-1] != path[-1]:
-            simplified.append(path[-1])
-
-        self.current_path = simplified
+        self.current_path = path
         self.path_idx = 0
 
         self.get_logger().info(
             f"Planned path to frontier ({goal_x:.0f}, {goal_y:.0f}), "
-            f"{len(simplified)} waypoints, dist={best_dist:.0f}m"
+            f"{len(path)} waypoints, dist={best_dist:.0f}m"
         )
 
-        # Publish visualizations
-        self._publish_path(simplified)
+        self._publish_path(path)
         self._publish_frontiers(clusters)
         self._publish_goal_marker(goal_x, goal_y, r=0.0, g=1.0, b=0.0)
 
     # ------------------------------------------------------------------
-    # Path following helpers
+    # Control loop (fast timer) — pure pursuit path following
     # ------------------------------------------------------------------
 
-    def _get_lookahead_point(self) -> tuple[float, float]:
-        """Find the point on the path at lookahead_dist from the agent."""
-        # Start from current path_idx
-        for i in range(self.path_idx, len(self.current_path)):
-            wx, wy = self.current_path[i]
-            d = math.hypot(wx - self.agent_x, wy - self.agent_y)
-            if d >= self.lookahead_dist:
+    def _control_loop(self):
+        if self.state == State.WAITING or not self.has_pose or self.grid is None:
+            return
+
+        # Check for reward objects → transition to COLLECT
+        if self.reward_visible and self.state == State.EXPLORE:
+            self.state = State.COLLECT
+            self.get_logger().info(
+                f"Reward spotted! bearing={math.degrees(self.reward_bearing):.1f}deg "
+                f"dist={self.reward_distance:.1f}m -> COLLECT"
+            )
+
+        if self.state == State.COLLECT:
+            self._do_collect()
+        elif self.state == State.EXPLORE:
+            self._do_explore()
+
+    def _do_collect(self):
+        """Pure-pursuit toward reward bearing."""
+        if not self.reward_visible:
+            self.get_logger().info("Reward no longer visible -> EXPLORE")
+            self.state = State.EXPLORE
+            self.current_path = []
+            self._replan_requested = True
+            return
+
+        # Treat the reward as a virtual lookahead point in local frame
+        angle_error = self.reward_bearing
+        d_l = max(self.reward_distance, 0.1)
+
+        # Lateral offset in robot-local frame
+        delta_y = d_l * math.sin(angle_error)
+
+        # Pure pursuit: ω = 2·v·Δy / d_l²
+        alignment = max(0.0, math.cos(angle_error))
+        v = self.max_linear_vel * (0.3 + 0.7 * alignment)
+        omega = 2.0 * v * delta_y / (d_l * d_l)
+        omega = self._clamp(omega, -self.max_angular_vel, self.max_angular_vel)
+
+        # Obstacle check
+        linear_x, omega = self._apply_obstacle_avoidance(v, omega)
+
+        self._publish_vel(linear_x, omega)
+
+        # Publish goal marker
+        reward_wx = self.agent_x + self.reward_distance * math.cos(
+            self.agent_yaw + self.reward_bearing
+        )
+        reward_wy = self.agent_y + self.reward_distance * math.sin(
+            self.agent_yaw + self.reward_bearing
+        )
+        self._publish_goal_marker(reward_wx, reward_wy, r=1.0, g=0.8, b=0.0)
+
+    def _do_explore(self):
+        """Pure-pursuit (carrot-on-a-stick) path following."""
+        if not self.current_path:
+            self._publish_zero_vel()
+            return
+
+        # Advance path_idx past reached waypoints
+        while self.path_idx < len(self.current_path):
+            wx, wy = self.current_path[self.path_idx]
+            dist = math.hypot(wx - self.agent_x, wy - self.agent_y)
+            if dist < self.grid_resolution:
+                self.path_idx += 1
+            else:
+                break
+
+        if self.path_idx >= len(self.current_path):
+            self._publish_zero_vel()
+            return
+
+        # Find the carrot: lookahead point on the path at distance d_l
+        carrot_x, carrot_y = self._find_carrot()
+
+        # Transform carrot to robot-local frame
+        dx = carrot_x - self.agent_x
+        dy = carrot_y - self.agent_y
+        # Rotate into robot frame (x=forward, y=left)
+        local_x = math.cos(self.agent_yaw) * dx + math.sin(self.agent_yaw) * dy
+        local_y = -math.sin(self.agent_yaw) * dx + math.cos(self.agent_yaw) * dy
+
+        d_l = math.hypot(local_x, local_y)
+        if d_l < 0.01:
+            self._publish_zero_vel()
+            return
+
+        # Pure pursuit: curvature κ = 2·Δy / d_l²,  ω = v · κ
+        # Δy is the lateral offset in robot frame
+        delta_y = local_y
+        curvature = 2.0 * delta_y / (d_l * d_l)
+
+        # Reduce forward speed when high curvature is needed (tight turns)
+        # angle_to_carrot in local frame: atan2(local_y, local_x)
+        angle_to_carrot = math.atan2(local_y, local_x)
+        alignment = max(0.0, math.cos(angle_to_carrot))
+        v = self.max_linear_vel * (0.3 + 0.7 * alignment)
+
+        omega = v * curvature
+        omega = self._clamp(omega, -self.max_angular_vel, self.max_angular_vel)
+
+        # Obstacle check
+        linear_x, omega = self._apply_obstacle_avoidance(v, omega)
+
+        self._publish_vel(linear_x, omega)
+
+        # Publish carrot marker
+        self._publish_carrot_marker(carrot_x, carrot_y)
+
+    def _find_carrot(self) -> tuple[float, float]:
+        """Find the carrot point: first path point at least lookahead_dist away.
+
+        Interpolates between waypoints for a smooth carrot position.
+        """
+        path = self.current_path
+        ax, ay = self.agent_x, self.agent_y
+        d_l = self.lookahead_dist
+
+        # Walk along the path from path_idx, accumulating distance
+        for i in range(self.path_idx, len(path)):
+            wx, wy = path[i]
+            dist = math.hypot(wx - ax, wy - ay)
+            if dist >= d_l:
+                # Interpolate between previous point and this one
+                if i > self.path_idx:
+                    px, py = path[i - 1]
+                    prev_dist = math.hypot(px - ax, py - ay)
+                    seg_len = math.hypot(wx - px, wy - py)
+                    if seg_len > 0.01:
+                        # How far along this segment to reach d_l
+                        remaining = d_l - prev_dist
+                        t = self._clamp(remaining / seg_len, 0.0, 1.0)
+                        return (px + t * (wx - px), py + t * (wy - py))
                 return wx, wy
-        # If no point is far enough, return the last waypoint
-        return self.current_path[-1]
+
+        # Path is shorter than lookahead — return last point
+        return path[-1]
+
+    def _apply_obstacle_avoidance(
+        self, v: float, omega: float
+    ) -> tuple[float, float]:
+        """Reduce speed or back up based on front obstacle distance."""
+        min_front = self._get_min_front_range()
+        if min_front < self.safety_dist:
+            # Back up and turn away from closest obstacle side
+            v = -1.0
+            # Turn away from the side with the closest obstacle
+            omega = self._get_avoidance_omega()
+        elif min_front < self.obstacle_slowdown_dist:
+            factor = (min_front - self.safety_dist) / (
+                self.obstacle_slowdown_dist - self.safety_dist
+            )
+            v *= factor
+        return v, omega
+
+    def _get_avoidance_omega(self) -> float:
+        """Compute angular velocity to turn away from the closest obstacle."""
+        if self.latest_scan is None:
+            return self.max_angular_vel
+        scan = self.latest_scan
+        # Sum up inverse-range contributions from left vs right
+        left_weight = 0.0
+        right_weight = 0.0
+        for i, r in enumerate(scan.ranges):
+            if r <= 0:
+                continue
+            angle = scan.angle_min + i * scan.angle_increment
+            w = 1.0 / (r + 0.1)
+            if angle > 0:
+                left_weight += w
+            else:
+                right_weight += w
+        # Turn away from the heavier side
+        if left_weight > right_weight:
+            return -self.max_angular_vel  # turn right
+        return self.max_angular_vel  # turn left
 
     def _get_min_front_range(self) -> float:
         """Minimum range in the forward +-30 degree cone."""
@@ -632,7 +634,6 @@ class ForagingExplorer(Node):
     def _publish_frontiers(self, clusters: list[list[tuple[int, int]]]):
         ma = MarkerArray()
 
-        # First, delete all previous markers
         delete_marker = Marker()
         delete_marker.header.frame_id = "odom"
         delete_marker.action = Marker.DELETEALL
@@ -642,7 +643,7 @@ class ForagingExplorer(Node):
             m = Marker()
             m.header.frame_id = "odom"
             m.ns = "frontiers"
-            m.id = ci + 1  # offset by 1 since 0 is DELETEALL
+            m.id = ci + 1
             m.type = Marker.POINTS
             m.action = Marker.ADD
             m.scale.x = self.grid_resolution
@@ -650,7 +651,6 @@ class ForagingExplorer(Node):
             m.color = ColorRGBA(r=0.0, g=0.5, b=1.0, a=0.6)
             m.pose.orientation.w = 1.0
 
-            # Subsample if too many points
             step = max(1, len(cluster) // 200)
             for i in range(0, len(cluster), step):
                 col, row = cluster[i]
@@ -660,6 +660,23 @@ class ForagingExplorer(Node):
             ma.markers.append(m)
 
         self.pub_frontiers.publish(ma)
+
+    def _publish_carrot_marker(self, wx: float, wy: float):
+        m = Marker()
+        m.header.frame_id = "odom"
+        m.ns = "carrot"
+        m.id = 0
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x = wx
+        m.pose.position.y = wy
+        m.pose.position.z = 0.5
+        m.pose.orientation.w = 1.0
+        m.scale.x = 1.5
+        m.scale.y = 1.5
+        m.scale.z = 1.5
+        m.color = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.9)  # orange
+        self.pub_carrot.publish(m)
 
     def _publish_goal_marker(self, wx: float, wy: float, r=0.0, g=1.0, b=0.0):
         m = Marker()

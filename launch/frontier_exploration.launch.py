@@ -28,6 +28,7 @@ def launch_setup(context, *args, **kwargs):
     scene_name = LaunchConfiguration("scene_name").perform(context)
     seeds = LaunchConfiguration("seeds").perform(context)
     episodes_per_seed = LaunchConfiguration("episodes_per_seed").perform(context)
+    rtf = LaunchConfiguration("rtf").perform(context)
 
     grid_resolution = LaunchConfiguration("grid_resolution").perform(context)
     inflation_radius = LaunchConfiguration("inflation_radius").perform(context)
@@ -35,6 +36,7 @@ def launch_setup(context, *args, **kwargs):
     descriptor_dimension = LaunchConfiguration("descriptor_dimension").perform(context)
     max_linear_vel = LaunchConfiguration("max_linear_vel").perform(context)
     max_angular_vel = LaunchConfiguration("max_angular_vel").perform(context)
+    lookahead_dist = LaunchConfiguration("lookahead_dist").perform(context)
 
     bridge_node = Node(
         package="ratsim_ros2",
@@ -52,6 +54,7 @@ def launch_setup(context, *args, **kwargs):
                 "scene_name": scene_name,
                 "seeds": seeds,
                 "episodes_per_seed": int(episodes_per_seed),
+                "rtf": float(rtf),
             }
         ],
     )
@@ -69,6 +72,7 @@ def launch_setup(context, *args, **kwargs):
                 "descriptor_dimension": int(descriptor_dimension),
                 "max_linear_vel": float(max_linear_vel),
                 "max_angular_vel": float(max_angular_vel),
+                "lookahead_dist": float(lookahead_dist),
             }
         ],
     )
@@ -89,13 +93,15 @@ def generate_launch_description():
             DeclareLaunchArgument("scene_name", default_value="Wildfire"),
             DeclareLaunchArgument("seeds", default_value="1,2,3,4,5,6,7,8,9,10"),
             DeclareLaunchArgument("episodes_per_seed", default_value="1"),
+            DeclareLaunchArgument("rtf", default_value="1.0"),
             # Explorer parameters
             DeclareLaunchArgument("grid_resolution", default_value="1.0"),
             DeclareLaunchArgument("inflation_radius", default_value="2.0"),
             DeclareLaunchArgument("reward_descriptor_index", default_value="2"),
             DeclareLaunchArgument("descriptor_dimension", default_value="3"),
             DeclareLaunchArgument("max_linear_vel", default_value="10.0"),
-            DeclareLaunchArgument("max_angular_vel", default_value="1.5"),
+            DeclareLaunchArgument("max_angular_vel", default_value="2.0"),
+            DeclareLaunchArgument("lookahead_dist", default_value="5.0"),
             OpaqueFunction(function=launch_setup),
         ]
     )

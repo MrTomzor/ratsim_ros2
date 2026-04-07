@@ -385,7 +385,12 @@ class QuadtreeOccupancyGrid:
         goal_wy: float,
         inflation_radius: float = 2.0,
     ) -> Optional[List[Tuple[float, float]]]:
-        """A* on the inflated grid. Returns list of (wx, wy) waypoints or None."""
+        """A* on the inflated grid. Returns list of (wx, wy) waypoints or None.
+
+        If the start cell is inside the inflated zone (robot pushed into wall),
+        the search is allowed to expand from occupied cells near the start so
+        the robot can escape.
+        """
         grid = self.get_inflated_grid(inflation_radius)
         sc, sr = self.world_to_cell(start_wx, start_wy)
         gc, gr = self.world_to_cell(goal_wx, goal_wy)
@@ -394,6 +399,18 @@ class QuadtreeOccupancyGrid:
             return None
         if grid[gr, gc] == OCCUPIED:
             return None
+
+        # If start is in inflated zone, allow escaping: mark cells within a
+        # small radius of the start as passable.
+        start_in_obstacle = grid[sr, sc] == OCCUPIED
+        escape_set = set()
+        if start_in_obstacle:
+            escape_r = int(math.ceil(inflation_radius / self.min_resolution)) + 1
+            for dr in range(-escape_r, escape_r + 1):
+                for dc in range(-escape_r, escape_r + 1):
+                    nc, nr = sc + dc, sr + dr
+                    if self._in_bounds(nc, nr) and dc * dc + dr * dr <= escape_r * escape_r:
+                        escape_set.add((nc, nr))
 
         # 8-connected neighbors with costs
         neighbors = [
@@ -431,10 +448,13 @@ class QuadtreeOccupancyGrid:
                 nc, nr = cc + dc, cr + dr
                 if not self._in_bounds(nc, nr):
                     continue
-                if grid[nr, nc] == OCCUPIED:
+                cell_val = grid[nr, nc]
+                if cell_val == OCCUPIED and (nc, nr) not in escape_set:
                     continue
                 # Allow traversal through unknown — we'll replan if we discover obstacles
-                ng = g + cost
+                # Add penalty for traversing inflated cells to prefer clear paths
+                extra_cost = 5.0 if cell_val == OCCUPIED else 0.0
+                ng = g + cost + extra_cost
                 if ng < g_score.get((nc, nr), float("inf")):
                     g_score[(nc, nr)] = ng
                     came_from[(nc, nr)] = (cc, cr)

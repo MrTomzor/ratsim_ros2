@@ -73,6 +73,8 @@ class UnityRos2Bridge(Node):
         self.declare_parameter("seeds", "1,2,3,4,5,6,7,8,9,10")
         self.declare_parameter("episodes_per_seed", 1)
         self.declare_parameter("episode_max_steps", 2000)
+        self.declare_parameter("rtf", 1.0)          # real-time factor (0 = unlimited)
+        self.declare_parameter("physics_dt", 0.1)    # Unity physics step time in seconds
 
         # Load configs: prefer JSON params, fall back to presets via blend_presets
         world_json_str = self.get_parameter("world_config_json").value or ""
@@ -106,6 +108,8 @@ class UnityRos2Bridge(Node):
         self.seeds = [int(s.strip()) for s in seeds_str.split(",")]
         self.episodes_per_seed = self.get_parameter("episodes_per_seed").value
         self.episode_max_steps_param = self.get_parameter("episode_max_steps").value
+        self.rtf = self.get_parameter("rtf").value
+        self.physics_dt = self.get_parameter("physics_dt").value
 
         # -- TaskTracker --
         self.task_tracker = TaskTracker(self.task_config)
@@ -207,8 +211,19 @@ class UnityRos2Bridge(Node):
                 time.sleep(0.01)
                 continue
 
+            # Rate-limit to target RTF
+            tick_start = time.monotonic()
+
             # Sim tick (blocks on TCP round-trip ~16ms)
             self._sim_tick()
+
+            # Sleep to maintain target RTF
+            if self.rtf > 0:
+                target_wall_dt = self.physics_dt / self.rtf
+                elapsed = time.monotonic() - tick_start
+                sleep_time = target_wall_dt - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
 
             # Check termination
             terminated = self.task_tracker.is_terminated()
