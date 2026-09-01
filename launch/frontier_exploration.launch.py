@@ -10,6 +10,11 @@ Usage:
         world_config_json:='{"world_bounds/width": 500, "seed": 42}' \
         agent_config_json:='{"prefab_name": "SphereAgent", ...}' \
         seeds:='1,2,3'
+
+    # Lockstep (default): the sim waits for each command — deterministic,
+    # RL-style stepping; replan_interval counts sim seconds. Free-running
+    # mode (wall-clock timers, non-deterministic):
+    ros2 launch ratsim_ros2 frontier_exploration.launch.py lockstep:=false
 """
 
 from launch import LaunchDescription
@@ -29,6 +34,7 @@ def launch_setup(context, *args, **kwargs):
     seeds = LaunchConfiguration("seeds").perform(context)
     episodes_per_seed = LaunchConfiguration("episodes_per_seed").perform(context)
     rtf = LaunchConfiguration("rtf").perform(context)
+    lockstep = LaunchConfiguration("lockstep").perform(context).lower() in ("true", "1")
 
     grid_resolution = LaunchConfiguration("grid_resolution").perform(context)
     inflation_radius = LaunchConfiguration("inflation_radius").perform(context)
@@ -55,6 +61,7 @@ def launch_setup(context, *args, **kwargs):
                 "seeds": seeds,
                 "episodes_per_seed": int(episodes_per_seed),
                 "rtf": float(rtf),
+                "lockstep": lockstep,
             }
         ],
     )
@@ -73,6 +80,7 @@ def launch_setup(context, *args, **kwargs):
                 "max_linear_vel": float(max_linear_vel),
                 "max_angular_vel": float(max_angular_vel),
                 "lookahead_dist": float(lookahead_dist),
+                "lockstep": lockstep,
             }
         ],
     )
@@ -94,6 +102,7 @@ def generate_launch_description():
             DeclareLaunchArgument("seeds", default_value="1,2,3,4,5,6,7,8,9,10"),
             DeclareLaunchArgument("episodes_per_seed", default_value="1"),
             DeclareLaunchArgument("rtf", default_value="1.0"),
+            DeclareLaunchArgument("lockstep", default_value="true"),
             # Explorer parameters
             DeclareLaunchArgument("grid_resolution", default_value="1.0"),
             DeclareLaunchArgument("inflation_radius", default_value="2.0"),

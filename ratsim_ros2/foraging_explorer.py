@@ -7,9 +7,14 @@ pure-pursuit (carrot-on-a-stick) path following.  When a reward object is
 detected via semantic lidar descriptors, the agent switches to COLLECT
 mode and approaches the reward.
 
-Architecture: two timers run at different rates:
-  - Planning timer (~0.5Hz): frontier detection, clustering, A* path planning
+Architecture, free mode (default): two wall timers at different rates:
+  - Planning tick (4Hz): replans immediately when the current path is
+    finished; otherwise at most every replan_interval seconds
   - Control timer (~50Hz): pure-pursuit path following / reward approach
+
+Lockstep mode (lockstep:=true): no timers; each /step_end from the bridge
+triggers plan (every replan_interval SIM seconds) + control, answered with
+/cmd_vel_stamped, which the bridge blocks on before the next sim tick.
 
 Subscribed topics:
     /scan              (sensor_msgs/LaserScan)
@@ -37,7 +42,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
-from geometry_msgs.msg import Twist, PoseStamped, Point
+from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Point
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from std_msgs.msg import Bool, Float32MultiArray, ColorRGBA, Header
@@ -71,6 +76,10 @@ class ForagingExplorer(Node):
         self.declare_parameter("safety_dist", 1.5)
         self.declare_parameter("pure_rotation_threshold", 1.2)  # radians (~70 deg)
         self.declare_parameter("control_rate", 50.0)       # Hz
+        # Lockstep: drive planning/control from the bridge's /step_end instead
+        # of wall timers, and answer every step with /cmd_vel_stamped so the
+        # sim waits for the command. replan_interval then counts SIM seconds.
+        self.declare_parameter("lockstep", True)
 
         self.grid_resolution = self.get_parameter("grid_resolution").value
         self.inflation_radius = self.get_parameter("inflation_radius").value
@@ -86,6 +95,7 @@ class ForagingExplorer(Node):
         self.safety_dist = self.get_parameter("safety_dist").value
         self.pure_rotation_threshold = self.get_parameter("pure_rotation_threshold").value
         control_rate = self.get_parameter("control_rate").value
+        self.lockstep = self.get_parameter("lockstep").value
 
         # -- State --
         self.state = State.WAITING
@@ -115,6 +125,11 @@ class ForagingExplorer(Node):
         self._odom_stamps: deque[tuple[int, int]] = deque()
         self._pending_scans: deque[LaserScan] = deque(maxlen=20)
 
+        # Lockstep bookkeeping
+        self._last_cmd: tuple[float, float] = (0.0, 0.0)
+        # Sim time (lockstep) or wall time (free mode) of the last planning run
+        self._last_plan_time: float | None = None
+
         # -- QoS for latched topics --
         latched_qos = QoSProfile(
             depth=1,
@@ -141,14 +156,25 @@ class ForagingExplorer(Node):
         self.pub_goal = self.create_publisher(Marker, "/goal_marker", 10)
         self.pub_carrot = self.create_publisher(Marker, "/carrot_marker", 10)
 
-        # -- Fast timer: pure-pursuit path following --
-        self.create_timer(1.0 / control_rate, self._control_loop)
+        if self.lockstep:
+            # Event-driven: one plan/control update per sim tick, answered
+            # with a stamped command the bridge blocks on.
+            self.pub_cmd_stamped = self.create_publisher(
+                TwistStamped, "/cmd_vel_stamped", 10
+            )
+            self.create_subscription(Header, "/step_end", self._step_end_cb, 10)
+        else:
+            # -- Fast timer: pure-pursuit path following --
+            self.create_timer(1.0 / control_rate, self._control_loop)
 
-        # -- Slow timer: frontier detection + A* planning --
-        self.create_timer(self.replan_interval, self._planning_loop)
+            # -- Planning: checked frequently so a finished path triggers an
+            # immediate replan; a full replan_interval only gates mid-path replans.
+            plan_period = max(0.05, min(0.25, self.replan_interval))
+            self.create_timer(plan_period, self._planning_tick)
 
         self.get_logger().info(
-            f"ForagingExplorer started: control={control_rate}Hz, "
+            f"ForagingExplorer started: mode={'lockstep' if self.lockstep else 'free'}, "
+            f"control={control_rate}Hz, "
             f"replan_interval={self.replan_interval}s, "
             f"lookahead={self.lookahead_dist}m"
         )
@@ -198,6 +224,7 @@ class ForagingExplorer(Node):
                 self._odom_by_stamp.clear()
                 self._odom_stamps.clear()
                 self._pending_scans.clear()
+                self._last_plan_time = None
                 self.state = State.EXPLORE
                 self._replan_requested = True
             else:
@@ -211,6 +238,7 @@ class ForagingExplorer(Node):
             self._odom_by_stamp.clear()
             self._odom_stamps.clear()
             self._pending_scans.clear()
+            self._last_plan_time = None
             self._publish_zero_vel()
 
     def _odom_cb(self, msg: Odometry):
@@ -361,11 +389,52 @@ class ForagingExplorer(Node):
         self.reward_visible = True
 
     # ------------------------------------------------------------------
+    # Lockstep step handler
+    # ------------------------------------------------------------------
+
+    def _step_end_cb(self, msg: Header):
+        """One sim tick's sensor batch is complete: plan, act, reply.
+
+        Odom and scan for this stamp were published before /step_end, so the
+        scan is already integrated by the time this runs (same executor
+        thread). The bridge blocks until it receives our /cmd_vel_stamped
+        echoing this stamp, so this MUST reply on every path.
+        """
+        sim_time = msg.stamp.sec + msg.stamp.nanosec * 1e-9
+
+        if self.state == State.WAITING or not self.has_pose or self.grid is None:
+            self._publish_zero_vel()
+        else:
+            self._maybe_plan(sim_time)
+            self._control_loop()
+
+        reply = TwistStamped()
+        reply.header.stamp = msg.stamp
+        reply.header.frame_id = msg.frame_id
+        reply.twist.linear.x = self._last_cmd[0]
+        reply.twist.angular.z = self._last_cmd[1]
+        self.pub_cmd_stamped.publish(reply)
+
+    # ------------------------------------------------------------------
     # Planning loop (slow timer)
     # ------------------------------------------------------------------
 
+    def _planning_tick(self):
+        """Free-mode planning timer body."""
+        self._maybe_plan(time.monotonic())
+
+    def _maybe_plan(self, now: float):
+        """Plan when a replan was requested (path finished, reward lost, new
+        episode) or when replan_interval elapsed. `now` is sim time in
+        lockstep, wall time in free mode."""
+        if (self._replan_requested
+                or self._last_plan_time is None
+                or now - self._last_plan_time >= self.replan_interval):
+            self._last_plan_time = now
+            self._planning_loop()
+
     def _planning_loop(self):
-        """Runs at low frequency: detect frontiers, plan A* path."""
+        """Detect frontiers, plan A* path."""
         if self.state not in (State.EXPLORE, State.COLLECT):
             return
         if not self.has_pose or self.grid is None:
@@ -379,6 +448,9 @@ class ForagingExplorer(Node):
 
     def _plan_to_frontier(self):
         """Find frontiers, pick closest, plan A* path."""
+        # Clear here, not in _maybe_plan: an early-out in _planning_loop
+        # (e.g. COLLECT) keeps the request pending.
+        self._replan_requested = False
         frontier_cells = self.grid.get_frontier_cells()
         if not frontier_cells:
             self.get_logger().info("No frontiers found.")
@@ -530,6 +602,10 @@ class ForagingExplorer(Node):
                 break
 
         if self.path_idx >= len(self.current_path):
+            # Path finished — ask for a fresh plan instead of parking until
+            # the next scheduled replan. (A failed plan empties current_path
+            # without setting this, so failures still retry on the interval.)
+            self._replan_requested = True
             self._publish_zero_vel()
             return
 
@@ -666,6 +742,7 @@ class ForagingExplorer(Node):
     # ------------------------------------------------------------------
 
     def _publish_vel(self, linear_x: float, angular_z: float):
+        self._last_cmd = (linear_x, angular_z)
         msg = Twist()
         msg.linear.x = linear_x
         msg.angular.z = angular_z

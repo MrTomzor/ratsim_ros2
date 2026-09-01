@@ -13,9 +13,15 @@ Published topics:
     /tf                (tf2_msgs/TFMessage via tf2_ros)
     /world_bounds      (std_msgs/Float32MultiArray)  — latched
     /episode_active    (std_msgs/Bool)               — latched
+    /step_end          (std_msgs/Header)  — end of each tick's sensor batch
 
 Subscribed topics:
-    /cmd_vel           (geometry_msgs/Twist)
+    /cmd_vel           (geometry_msgs/Twist)         — free mode
+    /cmd_vel_stamped   (geometry_msgs/TwistStamped)  — lockstep reply
+
+With lockstep:=true the sim loop blocks after each tick until a
+/cmd_vel_stamped echoing that tick's stamp arrives, so the controller
+paces the simulation (deterministic, RL-style stepping).
 
 Services:
     /reset_episode     (std_srvs/Trigger)
@@ -32,7 +38,7 @@ import rclpy.executors
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
-from geometry_msgs.msg import Twist, TransformStamped
+from geometry_msgs.msg import Twist, TwistStamped, TransformStamped
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Float32MultiArray, String, Header
@@ -74,7 +80,13 @@ class UnityRos2Bridge(Node):
         self.declare_parameter("episodes_per_seed", 1)
         self.declare_parameter("episode_max_steps", 2000)
         self.declare_parameter("rtf", 1.0)          # real-time factor (0 = unlimited)
-        self.declare_parameter("physics_dt", 0.1)    # Unity physics step time in seconds
+        # Unity physics step per tick — must match physicsStepTime serialized
+        # in SERVER.prefab (0.1), NOT the RoslikeTCPServer.cs field default.
+        self.declare_parameter("physics_dt", 0.1)
+        # Lockstep: after each tick, block until the controller answers the
+        # tick's /step_end with a /cmd_vel_stamped carrying the same stamp.
+        self.declare_parameter("lockstep", True)
+        self.declare_parameter("lockstep_timeout", 60.0)  # seconds, then step on
 
         # Load configs: prefer JSON params, fall back to presets via blend_presets
         world_json_str = self.get_parameter("world_config_json").value or ""
@@ -110,6 +122,8 @@ class UnityRos2Bridge(Node):
         self.episode_max_steps_param = self.get_parameter("episode_max_steps").value
         self.rtf = self.get_parameter("rtf").value
         self.physics_dt = self.get_parameter("physics_dt").value
+        self.lockstep = self.get_parameter("lockstep").value
+        self.lockstep_timeout = self.get_parameter("lockstep_timeout").value
 
         # -- TaskTracker --
         self.task_tracker = TaskTracker(self.task_config)
@@ -149,6 +163,9 @@ class UnityRos2Bridge(Node):
         )
         self.pub_episode_active = self.create_publisher(Bool, "/episode_active", latched_qos)
 
+        # End-of-batch marker, published every tick after odom + scan
+        self.pub_step_end = self.create_publisher(Header, "/step_end", 10)
+
         # TF broadcaster
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
@@ -158,6 +175,15 @@ class UnityRos2Bridge(Node):
             angular_x=0.0, angular_y=0.0, angular_z=0.0,
         )
         self.create_subscription(Twist, "/cmd_vel", self._cmd_vel_cb, 10)
+
+        # Lockstep handshake: the awaited reply IS the command, so there is no
+        # race between "ack arrived" and "cmd_vel arrived".
+        self._ack_event = threading.Event()
+        self._awaited_stamp: tuple[int, int] | None = None
+        self._ack_lock = threading.Lock()
+        self.create_subscription(
+            TwistStamped, "/cmd_vel_stamped", self._cmd_vel_stamped_cb, 10
+        )
 
         # -- ROS2 services --
         self.create_service(Trigger, "/reset_episode", self._reset_episode_cb)
@@ -288,6 +314,8 @@ class UnityRos2Bridge(Node):
     # ------------------------------------------------------------------
 
     def _cmd_vel_cb(self, msg: Twist):
+        if self.lockstep:
+            return  # in lockstep only /cmd_vel_stamped drives the sim
         if not hasattr(self, '_cmd_vel_log_count'):
             self._cmd_vel_log_count = 0
         self._cmd_vel_log_count += 1
@@ -303,6 +331,39 @@ class UnityRos2Bridge(Node):
             angular_y=msg.angular.y,
             angular_z=msg.angular.z,
         )
+
+    def _cmd_vel_stamped_cb(self, msg: TwistStamped):
+        """Lockstep reply: store the command and release the sim loop if the
+        stamp matches the step we are waiting on."""
+        tw = msg.twist
+        with self._ack_lock:
+            self.latest_cmd_vel = TwistMessage(
+                linear_x=tw.linear.x,
+                linear_y=tw.linear.y,
+                linear_z=tw.linear.z,
+                angular_x=tw.angular.x,
+                angular_y=tw.angular.y,
+                angular_z=tw.angular.z,
+            )
+            stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+            if self._awaited_stamp is not None and stamp == self._awaited_stamp:
+                self._ack_event.set()
+
+    def _wait_for_step_reply(self):
+        """Block the sim loop until the current step's command arrives."""
+        waited = 0.0
+        while not self._ack_event.wait(timeout=5.0):
+            waited += 5.0
+            if waited >= self.lockstep_timeout:
+                self.get_logger().warn(
+                    f"Lockstep: no /cmd_vel_stamped after {waited:.0f}s — stepping on."
+                )
+                break
+            self.get_logger().warn(
+                f"Lockstep: still waiting for /cmd_vel_stamped ({waited:.0f}s)..."
+            )
+        with self._ack_lock:
+            self._awaited_stamp = None
 
     # ------------------------------------------------------------------
     # Reset episode service
@@ -369,7 +430,7 @@ class UnityRos2Bridge(Node):
             return
 
         self.sim_step += 1
-        sim_time = self.sim_step * 0.02  # 50Hz physics
+        sim_time = self.sim_step * self.physics_dt
 
         # Update task tracker
         self.task_tracker.update_with_unity_msgs(msgs)
@@ -417,6 +478,19 @@ class UnityRos2Bridge(Node):
                 sem_msg = Float32MultiArray()
                 sem_msg.data = [float(d) for d in lidar_msg.descriptors]
                 self.pub_semantic.publish(sem_msg)
+
+        # End-of-batch marker. Arm the handshake BEFORE publishing so a fast
+        # reply can't slip past the wait.
+        end_msg = Header()
+        end_msg.stamp = create_ros_time(sim_time)
+        end_msg.frame_id = "odom"
+        with self._ack_lock:
+            self._awaited_stamp = (end_msg.stamp.sec, end_msg.stamp.nanosec)
+            self._ack_event.clear()
+        self.pub_step_end.publish(end_msg)
+
+        if self.lockstep:
+            self._wait_for_step_reply()
 
         # Log periodically
         if self.sim_step % 100 == 0:
