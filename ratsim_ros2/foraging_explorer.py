@@ -28,6 +28,7 @@ Published topics:
 
 import math
 import time
+from collections import deque
 from enum import Enum, auto
 
 import numpy as np
@@ -68,6 +69,7 @@ class ForagingExplorer(Node):
         self.declare_parameter("replan_interval", 2.0)     # seconds
         self.declare_parameter("map_publish_interval", 0.5)  # seconds
         self.declare_parameter("safety_dist", 1.5)
+        self.declare_parameter("pure_rotation_threshold", 1.2)  # radians (~70 deg)
         self.declare_parameter("control_rate", 50.0)       # Hz
 
         self.grid_resolution = self.get_parameter("grid_resolution").value
@@ -82,6 +84,7 @@ class ForagingExplorer(Node):
         self.replan_interval = self.get_parameter("replan_interval").value
         self.map_publish_interval = self.get_parameter("map_publish_interval").value
         self.safety_dist = self.get_parameter("safety_dist").value
+        self.pure_rotation_threshold = self.get_parameter("pure_rotation_threshold").value
         control_rate = self.get_parameter("control_rate").value
 
         # -- State --
@@ -104,6 +107,13 @@ class ForagingExplorer(Node):
 
         # Lidar data for obstacle checking
         self.latest_scan: LaserScan | None = None
+
+        # Scan<->pose pairing: the bridge stamps the scan and odom of one sim
+        # tick with the identical sim_time, so an exact stamp match pairs each
+        # scan with the pose it was sensed at, regardless of arrival order.
+        self._odom_by_stamp: dict[tuple[int, int], tuple[float, float, float]] = {}
+        self._odom_stamps: deque[tuple[int, int]] = deque()
+        self._pending_scans: deque[LaserScan] = deque(maxlen=20)
 
         # -- QoS for latched topics --
         latched_qos = QoSProfile(
@@ -152,7 +162,7 @@ class ForagingExplorer(Node):
             return
         w, h = msg.data[0], msg.data[1]
         self.get_logger().info(f"Received world bounds: {w} x {h}")
-        self._init_grid(w, h)
+        self._init_grid(w * 2, h * 2) # agent might not start at center of world, so make grid bigger
 
     def _init_grid(self, width: float, height: float):
         self.world_width = width
@@ -184,6 +194,10 @@ class ForagingExplorer(Node):
                 self.path_idx = 0
                 self.reward_visible = False
                 self.has_pose = False
+                # Stamps restart from 0 each episode — drop stale pairings
+                self._odom_by_stamp.clear()
+                self._odom_stamps.clear()
+                self._pending_scans.clear()
                 self.state = State.EXPLORE
                 self._replan_requested = True
             else:
@@ -194,6 +208,9 @@ class ForagingExplorer(Node):
             if self.state != State.WAITING:
                 self.get_logger().info("Episode ended -> WAITING")
             self.state = State.WAITING
+            self._odom_by_stamp.clear()
+            self._odom_stamps.clear()
+            self._pending_scans.clear()
             self._publish_zero_vel()
 
     def _odom_cb(self, msg: Odometry):
@@ -205,6 +222,24 @@ class ForagingExplorer(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.agent_yaw = math.atan2(siny_cosp, cosy_cosp)
         self.has_pose = True
+
+        stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+        self._odom_by_stamp[stamp] = (self.agent_x, self.agent_y, self.agent_yaw)
+        self._odom_stamps.append(stamp)
+        while len(self._odom_stamps) > 200:
+            old = self._odom_stamps.popleft()
+            self._odom_by_stamp.pop(old, None)
+
+        # Integrate any scans that were waiting for this pose
+        for _ in range(len(self._pending_scans)):
+            scan = self._pending_scans.popleft()
+            s_stamp = (scan.header.stamp.sec, scan.header.stamp.nanosec)
+            pose = self._odom_by_stamp.get(s_stamp)
+            if pose is not None:
+                self._integrate_scan(scan, pose)
+            else:
+                self._pending_scans.append(scan)
+
         if not prev_has_pose:
             self.get_logger().info(
                 f"First pose: x={self.agent_x:.1f}, y={self.agent_y:.1f}, "
@@ -213,7 +248,7 @@ class ForagingExplorer(Node):
 
     def _scan_cb(self, msg: LaserScan):
         self.latest_scan = msg
-        if self.grid is None or not self.has_pose:
+        if self.grid is None:
             return
 
         # Log first scan
@@ -228,10 +263,23 @@ class ForagingExplorer(Node):
                 f"range_max={msg.range_max:.1f}"
             )
 
+        stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+        pose = self._odom_by_stamp.get(stamp)
+        if pose is None:
+            # Same-tick odom not delivered yet — integrate when it arrives
+            self._pending_scans.append(msg)
+            return
+        self._integrate_scan(msg, pose)
+
+    def _integrate_scan(self, msg: LaserScan, pose: tuple[float, float, float]):
+        """Integrate a scan into the grid using the pose it was sensed at."""
+        if self.grid is None:
+            return
+        px, py, pyaw = pose
         self.grid.update_from_lidar(
-            agent_x=self.agent_x,
-            agent_y=self.agent_y,
-            agent_yaw=self.agent_yaw,
+            agent_x=px,
+            agent_y=py,
+            agent_yaw=pyaw,
             ranges=list(msg.ranges),
             angle_start_rad=msg.angle_min,
             angle_increment_rad=msg.angle_increment,
@@ -438,19 +486,24 @@ class ForagingExplorer(Node):
         angle_error = self.reward_bearing
         d_l = max(self.reward_distance, 0.1)
 
-        # Lateral offset in robot-local frame
-        delta_y = d_l * math.sin(angle_error)
+        # Pure rotation if reward is far off to the side
+        if abs(angle_error) > self.pure_rotation_threshold:
+            omega = self.max_angular_vel if angle_error > 0 else -self.max_angular_vel
+            self._publish_vel(0.0, omega)
+        else:
+            # Lateral offset in robot-local frame
+            delta_y = d_l * math.sin(angle_error)
 
-        # Pure pursuit: ω = 2·v·Δy / d_l²
-        alignment = max(0.0, math.cos(angle_error))
-        v = self.max_linear_vel * (0.3 + 0.7 * alignment)
-        omega = 2.0 * v * delta_y / (d_l * d_l)
-        omega = self._clamp(omega, -self.max_angular_vel, self.max_angular_vel)
+            # Pure pursuit: ω = 2·v·Δy / d_l²
+            alignment = max(0.0, math.cos(angle_error))
+            v = self.max_linear_vel * (0.3 + 0.7 * alignment)
+            omega = 2.0 * v * delta_y / (d_l * d_l)
+            omega = self._clamp(omega, -self.max_angular_vel, self.max_angular_vel)
 
-        # Obstacle check
-        linear_x, omega = self._apply_obstacle_avoidance(v, omega)
+            # Obstacle check
+            linear_x, omega = self._apply_obstacle_avoidance(v, omega)
 
-        self._publish_vel(linear_x, omega)
+            self._publish_vel(linear_x, omega)
 
         # Publish goal marker
         reward_wx = self.agent_x + self.reward_distance * math.cos(
@@ -467,7 +520,7 @@ class ForagingExplorer(Node):
             self._publish_zero_vel()
             return
 
-        # Advance path_idx past reached waypoints
+        # Advance path_idx past reached waypoints (monotonic — never goes backward)
         while self.path_idx < len(self.current_path):
             wx, wy = self.current_path[self.path_idx]
             dist = math.hypot(wx - self.agent_x, wy - self.agent_y)
@@ -481,7 +534,11 @@ class ForagingExplorer(Node):
             return
 
         # Find the carrot: lookahead point on the path at distance d_l
-        carrot_x, carrot_y = self._find_carrot()
+        carrot_x, carrot_y, carrot_idx = self._find_carrot()
+
+        # Ensure carrot index never goes backward along the path
+        if carrot_idx > self.path_idx:
+            self.path_idx = carrot_idx
 
         # Transform carrot to robot-local frame
         dx = carrot_x - self.agent_x
@@ -495,14 +552,20 @@ class ForagingExplorer(Node):
             self._publish_zero_vel()
             return
 
+        angle_to_carrot = math.atan2(local_y, local_x)
+
+        # Pure rotation: if carrot is behind us, rotate in place first
+        if abs(angle_to_carrot) > self.pure_rotation_threshold:
+            omega = self.max_angular_vel if angle_to_carrot > 0 else -self.max_angular_vel
+            self._publish_vel(0.0, omega)
+            self._publish_carrot_marker(carrot_x, carrot_y)
+            return
+
         # Pure pursuit: curvature κ = 2·Δy / d_l²,  ω = v · κ
-        # Δy is the lateral offset in robot frame
         delta_y = local_y
         curvature = 2.0 * delta_y / (d_l * d_l)
 
         # Reduce forward speed when high curvature is needed (tight turns)
-        # angle_to_carrot in local frame: atan2(local_y, local_x)
-        angle_to_carrot = math.atan2(local_y, local_x)
         alignment = max(0.0, math.cos(angle_to_carrot))
         v = self.max_linear_vel * (0.3 + 0.7 * alignment)
 
@@ -517,10 +580,11 @@ class ForagingExplorer(Node):
         # Publish carrot marker
         self._publish_carrot_marker(carrot_x, carrot_y)
 
-    def _find_carrot(self) -> tuple[float, float]:
+    def _find_carrot(self) -> tuple[float, float, int]:
         """Find the carrot point: first path point at least lookahead_dist away.
 
-        Interpolates between waypoints for a smooth carrot position.
+        Searches forward from path_idx only — the carrot never jumps backward.
+        Returns (carrot_x, carrot_y, path_index_of_carrot).
         """
         path = self.current_path
         ax, ay = self.agent_x, self.agent_y
@@ -537,14 +601,13 @@ class ForagingExplorer(Node):
                     prev_dist = math.hypot(px - ax, py - ay)
                     seg_len = math.hypot(wx - px, wy - py)
                     if seg_len > 0.01:
-                        # How far along this segment to reach d_l
                         remaining = d_l - prev_dist
                         t = self._clamp(remaining / seg_len, 0.0, 1.0)
-                        return (px + t * (wx - px), py + t * (wy - py))
-                return wx, wy
+                        return (px + t * (wx - px), py + t * (wy - py), i)
+                return (wx, wy, i)
 
         # Path is shorter than lookahead — return last point
-        return path[-1]
+        return (path[-1][0], path[-1][1], len(path) - 1)
 
     def _apply_obstacle_avoidance(
         self, v: float, omega: float

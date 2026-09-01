@@ -379,19 +379,9 @@ class UnityRos2Bridge(Node):
         clock_msg.clock = create_ros_time(sim_time)
         self.pub_clock.publish(clock_msg)
 
-        # Publish scan
-        if "/lidar2d" in msgs:
-            lidar_msg = msgs["/lidar2d"][0]
-            ros_scan = convert_lidar2d_to_laserscan(lidar_msg, sim_time)
-            self.pub_scan.publish(ros_scan)
-
-            # Publish semantic lidar (raw descriptors)
-            if lidar_msg.descriptors is not None:
-                sem_msg = Float32MultiArray()
-                sem_msg.data = [float(d) for d in lidar_msg.descriptors]
-                self.pub_semantic.publish(sem_msg)
-
-        # Publish odom + tf (try multiple pose topic names)
+        # Publish odom + tf BEFORE scan: consumers pair each scan with the
+        # same-stamp pose, so the pose should normally arrive first.
+        # (Try multiple pose topic names.)
         pose_msg = None
         for topic in ["/rat1_pose", "/rat1_pose_from_start"]:
             if topic in msgs:
@@ -415,6 +405,18 @@ class UnityRos2Bridge(Node):
             t.transform.rotation.z = pose_msg.qz if pose_msg.qz else 0.0
             t.transform.rotation.w = pose_msg.qw if pose_msg.qw else 1.0
             self.tf_broadcaster.sendTransform(t)
+
+        # Publish scan
+        if "/lidar2d" in msgs:
+            lidar_msg = msgs["/lidar2d"][0]
+            ros_scan = convert_lidar2d_to_laserscan(lidar_msg, sim_time)
+            self.pub_scan.publish(ros_scan)
+
+            # Publish semantic lidar (raw descriptors)
+            if lidar_msg.descriptors is not None:
+                sem_msg = Float32MultiArray()
+                sem_msg.data = [float(d) for d in lidar_msg.descriptors]
+                self.pub_semantic.publish(sem_msg)
 
         # Log periodically
         if self.sim_step % 100 == 0:
