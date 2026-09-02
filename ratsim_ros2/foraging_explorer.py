@@ -70,7 +70,13 @@ class ForagingExplorer(Node):
         self.declare_parameter("max_angular_vel", 2.0)
         self.declare_parameter("frontier_min_size", 5)
         self.declare_parameter("obstacle_slowdown_dist", 5.0)
-        self.declare_parameter("lookahead_dist", 5.0)
+        self.declare_parameter("lookahead_dist", 5.0)     # max; shrinks with speed
+        self.declare_parameter("min_lookahead", 0.8)
+        self.declare_parameter("goal_reached_dist", 1.0)
+        self.declare_parameter("path_clearance", 1.0)      # prefer cells this far from walls
+        self.declare_parameter("path_clearance_weight", 3.0)
+        self.declare_parameter("curve_speed_margin", 0.9)  # fraction of max omega usable via v*kappa
+        self.declare_parameter("astar_max_expansions", 60000)  # cap per A* call (~1s worst case)
         self.declare_parameter("replan_interval", 2.0)     # seconds
         self.declare_parameter("map_publish_interval", 0.5)  # seconds
         self.declare_parameter("safety_dist", 1.5)
@@ -90,6 +96,12 @@ class ForagingExplorer(Node):
         self.frontier_min_size = self.get_parameter("frontier_min_size").value
         self.obstacle_slowdown_dist = self.get_parameter("obstacle_slowdown_dist").value
         self.lookahead_dist = self.get_parameter("lookahead_dist").value
+        self.min_lookahead = self.get_parameter("min_lookahead").value
+        self.goal_reached_dist = self.get_parameter("goal_reached_dist").value
+        self.path_clearance = self.get_parameter("path_clearance").value
+        self.path_clearance_weight = self.get_parameter("path_clearance_weight").value
+        self.curve_speed_margin = self.get_parameter("curve_speed_margin").value
+        self.astar_max_expansions = self.get_parameter("astar_max_expansions").value
         self.replan_interval = self.get_parameter("replan_interval").value
         self.map_publish_interval = self.get_parameter("map_publish_interval").value
         self.safety_dist = self.get_parameter("safety_dist").value
@@ -129,6 +141,15 @@ class ForagingExplorer(Node):
         self._last_cmd: tuple[float, float] = (0.0, 0.0)
         # Sim time (lockstep) or wall time (free mode) of the last planning run
         self._last_plan_time: float | None = None
+
+        # Debug metrics (reset each episode)
+        self._ep_start_pos: tuple[float, float] | None = None
+        self._max_dist_from_start = 0.0
+        self._n_plans = 0
+        self._n_plan_failures = 0
+        self._n_goals_reached = 0
+        self._n_reflex_backups = 0
+        self._last_dbg_time = 0.0
 
         # -- QoS for latched topics --
         latched_qos = QoSProfile(
@@ -225,6 +246,13 @@ class ForagingExplorer(Node):
                 self._odom_stamps.clear()
                 self._pending_scans.clear()
                 self._last_plan_time = None
+                self._ep_start_pos = None
+                self._max_dist_from_start = 0.0
+                self._n_plans = 0
+                self._n_plan_failures = 0
+                self._n_goals_reached = 0
+                self._n_reflex_backups = 0
+                self._last_dbg_time = 0.0
                 self.state = State.EXPLORE
                 self._replan_requested = True
             else:
@@ -250,6 +278,14 @@ class ForagingExplorer(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.agent_yaw = math.atan2(siny_cosp, cosy_cosp)
         self.has_pose = True
+
+        if self._ep_start_pos is None:
+            self._ep_start_pos = (self.agent_x, self.agent_y)
+        dfs = math.hypot(
+            self.agent_x - self._ep_start_pos[0], self.agent_y - self._ep_start_pos[1]
+        )
+        if dfs > self._max_dist_from_start:
+            self._max_dist_from_start = dfs
 
         stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
         self._odom_by_stamp[stamp] = (self.agent_x, self.agent_y, self.agent_yaw)
@@ -408,6 +444,19 @@ class ForagingExplorer(Node):
             self._maybe_plan(sim_time)
             self._control_loop()
 
+        # Periodic debug line (every 5 sim seconds)
+        if sim_time - self._last_dbg_time >= 5.0:
+            self._last_dbg_time = sim_time
+            path_rem = max(0, len(self.current_path) - self.path_idx)
+            self.get_logger().info(
+                f"[dbg] t={sim_time:.1f}s pos=({self.agent_x:.1f},{self.agent_y:.1f}) "
+                f"dfs={self._max_dist_from_start:.1f} state={self.state.name} "
+                f"path_rem={path_rem} cmd=({self._last_cmd[0]:.2f},{self._last_cmd[1]:.2f}) "
+                f"minfront={self._get_min_front_range():.1f} "
+                f"plans={self._n_plans} fails={self._n_plan_failures} "
+                f"goals={self._n_goals_reached} backups={self._n_reflex_backups}"
+            )
+
         reply = TwistStamped()
         reply.header.stamp = msg.stamp
         reply.header.frame_id = msg.frame_id
@@ -447,10 +496,11 @@ class ForagingExplorer(Node):
         self._plan_to_frontier()
 
     def _plan_to_frontier(self):
-        """Find frontiers, pick closest, plan A* path."""
+        """Find frontiers, plan A* to the closest reachable one."""
         # Clear here, not in _maybe_plan: an early-out in _planning_loop
         # (e.g. COLLECT) keeps the request pending.
         self._replan_requested = False
+        self._n_plans += 1
         frontier_cells = self.grid.get_frontier_cells()
         if not frontier_cells:
             self.get_logger().info("No frontiers found.")
@@ -465,64 +515,121 @@ class ForagingExplorer(Node):
             self._publish_frontiers([])
             return
 
-        # Pick closest cluster centroid
-        best_cluster = None
-        best_dist = float("inf")
-        for cluster in clusters:
+        # Try clusters closest-first until one is reachable
+        def centroid_world(cluster):
             cc, cr = QuadtreeOccupancyGrid.cluster_centroid(cluster)
-            wx, wy = self.grid.cell_to_world(int(cc), int(cr))
-            d = math.hypot(wx - self.agent_x, wy - self.agent_y)
-            if d < best_dist:
-                best_dist = d
-                best_cluster = cluster
+            return self.grid.cell_to_world(int(cc), int(cr))
 
-        if best_cluster is None:
-            self.current_path = []
-            return
-
-        cc, cr = QuadtreeOccupancyGrid.cluster_centroid(best_cluster)
-        goal_x, goal_y = self.grid.cell_to_world(int(cc), int(cr))
-
-        # A* path
-        path = self.grid.astar(
-            self.agent_x, self.agent_y, goal_x, goal_y,
-            inflation_radius=self.inflation_radius,
+        candidates = sorted(
+            (centroid_world(c) for c in clusters),
+            key=lambda g: math.hypot(g[0] - self.agent_x, g[1] - self.agent_y),
         )
 
-        if path is None:
-            self.get_logger().info(
-                f"A* failed to frontier at ({goal_x:.0f}, {goal_y:.0f}), "
-                f"trying next cluster..."
+        # Goals already within reach are useless — "arriving" at one clears
+        # nothing and would loop plan->reached->plan forever in place.
+        min_goal_dist = self.goal_reached_dist + self.min_lookahead
+
+        path = None
+        goal_x = goal_y = 0.0
+        n_too_close = 0
+        n_astar_fails = 0
+        for raw_gx, raw_gy in candidates:
+            # Retract the goal off the free/unknown boundary into known-free,
+            # non-inflated space so the last stretch doesn't aim at a wall.
+            goal_x, goal_y = self._retract_goal(raw_gx, raw_gy)
+            if math.hypot(goal_x - self.agent_x, goal_y - self.agent_y) < min_goal_dist:
+                n_too_close += 1
+                path = None
+                continue
+            path = self.grid.astar(
+                self.agent_x, self.agent_y, goal_x, goal_y,
+                inflation_radius=self.inflation_radius,
+                clearance=self.path_clearance,
+                clearance_weight=self.path_clearance_weight,
+                max_expansions=self.astar_max_expansions,
             )
-            for cluster in clusters:
-                if cluster is best_cluster:
-                    continue
-                cc2, cr2 = QuadtreeOccupancyGrid.cluster_centroid(cluster)
-                gx2, gy2 = self.grid.cell_to_world(int(cc2), int(cr2))
-                path = self.grid.astar(
-                    self.agent_x, self.agent_y, gx2, gy2,
-                    inflation_radius=self.inflation_radius,
-                )
-                if path is not None:
-                    goal_x, goal_y = gx2, gy2
+            if path is None:
+                # Capped/unreachable goals are expensive — give up this cycle
+                # after a few and retry on the replan interval.
+                n_astar_fails += 1
+                if n_astar_fails >= 4:
                     break
+            if path is not None:
+                if (goal_x, goal_y) != (raw_gx, raw_gy):
+                    self.get_logger().info(
+                        f"Goal retracted ({raw_gx:.1f},{raw_gy:.1f}) -> "
+                        f"({goal_x:.1f},{goal_y:.1f})"
+                    )
+                break
 
         if path is None:
-            self.get_logger().info("A* failed for all frontier clusters.")
+            self._n_plan_failures += 1
+            self.get_logger().info(
+                f"No plan: {len(candidates)} clusters "
+                f"({n_too_close} within {min_goal_dist:.1f}m, rest unreachable)."
+            )
             self.current_path = []
             return
 
         self.current_path = path
         self.path_idx = 0
 
+        dist = math.hypot(goal_x - self.agent_x, goal_y - self.agent_y)
         self.get_logger().info(
             f"Planned path to frontier ({goal_x:.0f}, {goal_y:.0f}), "
-            f"{len(path)} waypoints, dist={best_dist:.0f}m"
+            f"{len(path)} waypoints, dist={dist:.0f}m, "
+            f"{len(clusters)} clusters"
         )
 
         self._publish_path(path)
         self._publish_frontiers(clusters)
         self._publish_goal_marker(goal_x, goal_y, r=0.0, g=1.0, b=0.0)
+
+    def _retract_goal(self, gx: float, gy: float) -> tuple[float, float]:
+        """Move a frontier goal into known-free, non-inflated space.
+
+        Steps from the goal toward the agent; if that fails, scans a small
+        box around the goal. Falls back to the original point."""
+        inflated = self.grid.get_inflated_grid(self.inflation_radius)
+
+        def ok(wx, wy):
+            c, r = self.grid.world_to_cell(wx, wy)
+            return self.grid._in_bounds(c, r) and inflated[r, c] == 0  # FREE
+
+        if ok(gx, gy):
+            return gx, gy
+
+        # Walk toward the agent
+        dx = self.agent_x - gx
+        dy = self.agent_y - gy
+        d = math.hypot(dx, dy)
+        if d > 1e-6:
+            step = self.grid_resolution / 2.0
+            max_retract = self.inflation_radius + 1.0
+            n_steps = int(max_retract / step)
+            for i in range(1, n_steps + 1):
+                wx = gx + dx / d * step * i
+                wy = gy + dy / d * step * i
+                if ok(wx, wy):
+                    return wx, wy
+
+        # Box scan around the goal, nearest cell first
+        r_cells = int(math.ceil(1.5 / self.grid_resolution))
+        gc, gr = self.grid.world_to_cell(gx, gy)
+        best = None
+        best_d2 = float("inf")
+        for drow in range(-r_cells, r_cells + 1):
+            for dcol in range(-r_cells, r_cells + 1):
+                c, r = gc + dcol, gr + drow
+                if not self.grid._in_bounds(c, r) or inflated[r, c] != 0:
+                    continue
+                d2 = drow * drow + dcol * dcol
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best = (c, r)
+        if best is not None:
+            return self.grid.cell_to_world(best[0], best[1])
+        return gx, gy
 
     # ------------------------------------------------------------------
     # Control loop (fast timer) — pure pursuit path following
@@ -592,6 +699,16 @@ class ForagingExplorer(Node):
             self._publish_zero_vel()
             return
 
+        # Goal reached when within goal_reached_dist of the path's end — the
+        # retracted goal sits in free space, no need to defend the last meter.
+        end_x, end_y = self.current_path[-1]
+        if math.hypot(end_x - self.agent_x, end_y - self.agent_y) < self.goal_reached_dist:
+            self._n_goals_reached += 1
+            self.current_path = []
+            self._replan_requested = True
+            self._publish_zero_vel()
+            return
+
         # Advance path_idx past reached waypoints (monotonic — never goes backward)
         while self.path_idx < len(self.current_path):
             wx, wy = self.current_path[self.path_idx]
@@ -610,11 +727,11 @@ class ForagingExplorer(Node):
             return
 
         # Find the carrot: lookahead point on the path at distance d_l
-        carrot_x, carrot_y, carrot_idx = self._find_carrot()
+        carrot_x, carrot_y, anchor_idx = self._find_carrot()
 
-        # Ensure carrot index never goes backward along the path
-        if carrot_idx > self.path_idx:
-            self.path_idx = carrot_idx
+        # Anchor (closest path point) never goes backward along the path
+        if anchor_idx > self.path_idx:
+            self.path_idx = anchor_idx
 
         # Transform carrot to robot-local frame
         dx = carrot_x - self.agent_x
@@ -641,9 +758,11 @@ class ForagingExplorer(Node):
         delta_y = local_y
         curvature = 2.0 * delta_y / (d_l * d_l)
 
-        # Reduce forward speed when high curvature is needed (tight turns)
-        alignment = max(0.0, math.cos(angle_to_carrot))
-        v = self.max_linear_vel * (0.3 + 0.7 * alignment)
+        # Curvature-limited speed: only as fast as the omega cap can steer.
+        # As demanded curvature grows, v -> 0 and this blends into a pivot.
+        v = self.max_linear_vel
+        if abs(curvature) > 1e-6:
+            v = min(v, self.curve_speed_margin * self.max_angular_vel / abs(curvature))
 
         omega = v * curvature
         omega = self._clamp(omega, -self.max_angular_vel, self.max_angular_vel)
@@ -657,33 +776,44 @@ class ForagingExplorer(Node):
         self._publish_carrot_marker(carrot_x, carrot_y)
 
     def _find_carrot(self) -> tuple[float, float, int]:
-        """Find the carrot point: first path point at least lookahead_dist away.
+        """Find the carrot: the point at lookahead arc length ALONG the path
+        ahead of the closest path point (walls-aware — never jumps across a
+        corner the way straight-line lookahead does).
 
-        Searches forward from path_idx only — the carrot never jumps backward.
-        Returns (carrot_x, carrot_y, path_index_of_carrot).
+        Lookahead scales with the last commanded speed so tight sections are
+        tracked tightly. Returns (carrot_x, carrot_y, anchor_index) where
+        anchor_index is the closest path point (monotonic path progress).
         """
         path = self.current_path
         ax, ay = self.agent_x, self.agent_y
-        d_l = self.lookahead_dist
+        d_l = self._clamp(
+            0.7 * max(self._last_cmd[0], 0.0), self.min_lookahead, self.lookahead_dist
+        )
 
-        # Walk along the path from path_idx, accumulating distance
-        for i in range(self.path_idx, len(path)):
+        # Re-anchor: closest path point, searching forward from path_idx
+        end = min(len(path), self.path_idx + 200)
+        anchor = self.path_idx
+        best_d = float("inf")
+        for i in range(self.path_idx, end):
+            d = math.hypot(path[i][0] - ax, path[i][1] - ay)
+            if d < best_d:
+                best_d = d
+                anchor = i
+
+        # Walk arc length along the path from the anchor
+        s = 0.0
+        px, py = path[anchor]
+        for i in range(anchor + 1, len(path)):
             wx, wy = path[i]
-            dist = math.hypot(wx - ax, wy - ay)
-            if dist >= d_l:
-                # Interpolate between previous point and this one
-                if i > self.path_idx:
-                    px, py = path[i - 1]
-                    prev_dist = math.hypot(px - ax, py - ay)
-                    seg_len = math.hypot(wx - px, wy - py)
-                    if seg_len > 0.01:
-                        remaining = d_l - prev_dist
-                        t = self._clamp(remaining / seg_len, 0.0, 1.0)
-                        return (px + t * (wx - px), py + t * (wy - py), i)
-                return (wx, wy, i)
+            seg = math.hypot(wx - px, wy - py)
+            if s + seg >= d_l and seg > 1e-9:
+                t = (d_l - s) / seg
+                return (px + t * (wx - px), py + t * (wy - py), anchor)
+            s += seg
+            px, py = wx, wy
 
-        # Path is shorter than lookahead — return last point
-        return (path[-1][0], path[-1][1], len(path) - 1)
+        # Path shorter than lookahead — carrot is the last point
+        return (path[-1][0], path[-1][1], anchor)
 
     def _apply_obstacle_avoidance(
         self, v: float, omega: float
@@ -692,6 +822,7 @@ class ForagingExplorer(Node):
         min_front = self._get_min_front_range()
         if min_front < self.safety_dist:
             # Back up and turn away from closest obstacle side
+            self._n_reflex_backups += 1
             v = -1.0
             # Turn away from the side with the closest obstacle
             omega = self._get_avoidance_omega()

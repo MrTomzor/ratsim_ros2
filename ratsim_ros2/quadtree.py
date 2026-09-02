@@ -140,6 +140,8 @@ class QuadtreeOccupancyGrid:
         self._flat_cache: Optional[np.ndarray] = None
         self._inflated_cache: Optional[np.ndarray] = None
         self._inflated_radius: float = -1.0
+        self._prox_cache: Optional[np.ndarray] = None
+        self._prox_key: tuple = ()
 
     # ---- coordinate helpers -----------------------------------------------
 
@@ -170,6 +172,7 @@ class QuadtreeOccupancyGrid:
     def set_cell(self, wx: float, wy: float, value: int):
         self._flat_cache = None
         self._inflated_cache = None
+        self._prox_cache = None
         self._set_recursive(self._root, wx, wy, value)
 
     def _set_recursive(self, node: _QuadNode, wx: float, wy: float, value: int):
@@ -203,6 +206,7 @@ class QuadtreeOccupancyGrid:
         """
         self._flat_cache = None
         self._inflated_cache = None
+        self._prox_cache = None
 
         cos_yaw = math.cos(agent_yaw)
         sin_yaw = math.sin(agent_yaw)
@@ -313,6 +317,28 @@ class QuadtreeOccupancyGrid:
         self._inflated_radius = inflation_radius
         return inflated_grid
 
+    def get_proximity_cost(
+        self, inflation_radius: float, clearance: float, weight: float
+    ) -> np.ndarray:
+        """Per-cell extra path cost that ramps from `weight` (adjacent to an
+        inflated obstacle) down to 0 (at >= clearance meters away), pushing
+        A* paths toward corridor centerlines."""
+        key = (inflation_radius, clearance, weight)
+        if self._prox_cache is not None and self._prox_key == key:
+            return self._prox_cache
+
+        from scipy.ndimage import distance_transform_edt
+        grid = self.get_inflated_grid(inflation_radius)
+        occupied = (grid == OCCUPIED)
+        # Distance (in cells) from every cell to the nearest occupied cell
+        dist = distance_transform_edt(~occupied)
+        clear_cells = max(clearance / self.min_resolution, 1e-6)
+        cost = np.clip(1.0 - dist / clear_cells, 0.0, 1.0) * weight
+
+        self._prox_cache = cost.astype(np.float32)
+        self._prox_key = key
+        return self._prox_cache
+
     # ---- frontier detection -----------------------------------------------
 
     def get_frontier_cells(self) -> List[Tuple[int, int]]:
@@ -384,14 +410,28 @@ class QuadtreeOccupancyGrid:
         goal_wx: float,
         goal_wy: float,
         inflation_radius: float = 2.0,
+        clearance: float = 0.0,
+        clearance_weight: float = 0.0,
+        max_expansions: int = 0,
+        search_margin: float = 10.0,
     ) -> Optional[List[Tuple[float, float]]]:
         """A* on the inflated grid. Returns list of (wx, wy) waypoints or None.
 
         If the start cell is inside the inflated zone (robot pushed into wall),
         the search is allowed to expand from occupied cells near the start so
-        the robot can escape.
+        the robot can escape.  With clearance > 0, cells within `clearance`
+        meters of an inflated obstacle cost up to `clearance_weight` extra,
+        so paths prefer corridor centerlines.
+
+        Unknown cells are traversable, so an unreachable goal would flood the
+        entire unexplored world; the search is therefore confined to the
+        observed region's bounding box (+search_margin meters) and gives up
+        after max_expansions pops (0 = unlimited).
         """
         grid = self.get_inflated_grid(inflation_radius)
+        prox = None
+        if clearance > 0.0 and clearance_weight > 0.0:
+            prox = self.get_proximity_cost(inflation_radius, clearance, clearance_weight)
         sc, sr = self.world_to_cell(start_wx, start_wy)
         gc, gr = self.world_to_cell(goal_wx, goal_wy)
 
@@ -399,6 +439,20 @@ class QuadtreeOccupancyGrid:
             return None
         if grid[gr, gc] == OCCUPIED:
             return None
+
+        # Search-region bounding box: observed cells + margin (always
+        # containing start and goal)
+        known_rows = np.nonzero(np.any(grid != UNKNOWN, axis=1))[0]
+        known_cols = np.nonzero(np.any(grid != UNKNOWN, axis=0))[0]
+        if len(known_rows) > 0:
+            m = int(math.ceil(search_margin / self.min_resolution))
+            row_lo = min(int(known_rows[0]) - m, sr, gr)
+            row_hi = max(int(known_rows[-1]) + m, sr, gr)
+            col_lo = min(int(known_cols[0]) - m, sc, gc)
+            col_hi = max(int(known_cols[-1]) + m, sc, gc)
+        else:
+            row_lo, col_lo = 0, 0
+            row_hi, col_hi = self.cells_y - 1, self.cells_x - 1
 
         # If start is in inflated zone, allow escaping: mark cells within a
         # small radius of the start as passable.
@@ -424,9 +478,13 @@ class QuadtreeOccupancyGrid:
         open_set = [(heuristic(sc, sr), 0.0, sc, sr)]
         g_score = {(sc, sr): 0.0}
         came_from = {}
+        expansions = 0
 
         while open_set:
             f, g, cc, cr = heapq.heappop(open_set)
+            expansions += 1
+            if max_expansions and expansions > max_expansions:
+                return None
 
             if cc == gc and cr == gr:
                 # Reconstruct path
@@ -448,12 +506,16 @@ class QuadtreeOccupancyGrid:
                 nc, nr = cc + dc, cr + dr
                 if not self._in_bounds(nc, nr):
                     continue
+                if not (col_lo <= nc <= col_hi and row_lo <= nr <= row_hi):
+                    continue
                 cell_val = grid[nr, nc]
                 if cell_val == OCCUPIED and (nc, nr) not in escape_set:
                     continue
                 # Allow traversal through unknown — we'll replan if we discover obstacles
                 # Add penalty for traversing inflated cells to prefer clear paths
                 extra_cost = 5.0 if cell_val == OCCUPIED else 0.0
+                if prox is not None:
+                    extra_cost += prox[nr, nc]
                 ng = g + cost + extra_cost
                 if ng < g_score.get((nc, nr), float("inf")):
                     g_score[(nc, nr)] = ng
@@ -502,3 +564,4 @@ class QuadtreeOccupancyGrid:
         self._root = _QuadNode(cx, cy, self._grid_side / 2.0, UNKNOWN)
         self._flat_cache = None
         self._inflated_cache = None
+        self._prox_cache = None
