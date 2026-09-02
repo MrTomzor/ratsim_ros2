@@ -69,7 +69,7 @@ class ForagingExplorer(Node):
         self.declare_parameter("max_linear_vel", 10.0)
         self.declare_parameter("max_angular_vel", 2.0)
         self.declare_parameter("frontier_min_size", 5)
-        self.declare_parameter("obstacle_slowdown_dist", 5.0)
+        self.declare_parameter("obstacle_slowdown_dist", 1.5)
         self.declare_parameter("lookahead_dist", 5.0)     # max; shrinks with speed
         self.declare_parameter("min_lookahead", 0.8)
         self.declare_parameter("goal_reached_dist", 1.0)

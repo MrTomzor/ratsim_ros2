@@ -36,13 +36,11 @@ def launch_setup(context, *args, **kwargs):
     rtf = LaunchConfiguration("rtf").perform(context)
     lockstep = LaunchConfiguration("lockstep").perform(context).lower() in ("true", "1")
 
-    grid_resolution = LaunchConfiguration("grid_resolution").perform(context)
-    inflation_radius = LaunchConfiguration("inflation_radius").perform(context)
-    reward_descriptor_index = LaunchConfiguration("reward_descriptor_index").perform(context)
-    descriptor_dimension = LaunchConfiguration("descriptor_dimension").perform(context)
-    max_linear_vel = LaunchConfiguration("max_linear_vel").perform(context)
-    max_angular_vel = LaunchConfiguration("max_angular_vel").perform(context)
-    lookahead_dist = LaunchConfiguration("lookahead_dist").perform(context)
+    def farg(name: str) -> float:
+        return float(LaunchConfiguration(name).perform(context))
+
+    def iarg(name: str) -> int:
+        return int(LaunchConfiguration(name).perform(context))
 
     bridge_node = Node(
         package="ratsim_ros2",
@@ -73,13 +71,26 @@ def launch_setup(context, *args, **kwargs):
         output="screen",
         parameters=[
             {
-                "grid_resolution": float(grid_resolution),
-                "inflation_radius": float(inflation_radius),
-                "reward_descriptor_index": int(reward_descriptor_index),
-                "descriptor_dimension": int(descriptor_dimension),
-                "max_linear_vel": float(max_linear_vel),
-                "max_angular_vel": float(max_angular_vel),
-                "lookahead_dist": float(lookahead_dist),
+                "grid_resolution": farg("grid_resolution"),
+                "inflation_radius": farg("inflation_radius"),
+                "reward_descriptor_index": iarg("reward_descriptor_index"),
+                "descriptor_dimension": iarg("descriptor_dimension"),
+                "max_linear_vel": farg("max_linear_vel"),
+                "max_angular_vel": farg("max_angular_vel"),
+                "lookahead_dist": farg("lookahead_dist"),
+                "min_lookahead": farg("min_lookahead"),
+                "goal_reached_dist": farg("goal_reached_dist"),
+                "path_clearance": farg("path_clearance"),
+                "path_clearance_weight": farg("path_clearance_weight"),
+                "curve_speed_margin": farg("curve_speed_margin"),
+                "astar_max_expansions": iarg("astar_max_expansions"),
+                "frontier_min_size": iarg("frontier_min_size"),
+                "obstacle_slowdown_dist": farg("obstacle_slowdown_dist"),
+                "safety_dist": farg("safety_dist"),
+                "pure_rotation_threshold": farg("pure_rotation_threshold"),
+                "replan_interval": farg("replan_interval"),
+                "control_rate": farg("control_rate"),
+                "map_publish_interval": farg("map_publish_interval"),
                 "lockstep": lockstep,
             }
         ],
@@ -103,7 +114,7 @@ def generate_launch_description():
             DeclareLaunchArgument("episodes_per_seed", default_value="1"),
             DeclareLaunchArgument("rtf", default_value="1.0"),
             DeclareLaunchArgument("lockstep", default_value="true"),
-            # Explorer parameters
+            # Explorer parameters (defaults match the node's declare_parameter defaults)
             DeclareLaunchArgument("grid_resolution", default_value="1.0"),
             DeclareLaunchArgument("inflation_radius", default_value="2.0"),
             DeclareLaunchArgument("reward_descriptor_index", default_value="2"),
@@ -111,6 +122,19 @@ def generate_launch_description():
             DeclareLaunchArgument("max_linear_vel", default_value="10.0"),
             DeclareLaunchArgument("max_angular_vel", default_value="2.0"),
             DeclareLaunchArgument("lookahead_dist", default_value="5.0"),
+            DeclareLaunchArgument("min_lookahead", default_value="0.8"),
+            DeclareLaunchArgument("goal_reached_dist", default_value="1.0"),
+            DeclareLaunchArgument("path_clearance", default_value="1.0"),
+            DeclareLaunchArgument("path_clearance_weight", default_value="3.0"),
+            DeclareLaunchArgument("curve_speed_margin", default_value="0.9"),
+            DeclareLaunchArgument("astar_max_expansions", default_value="60000"),
+            DeclareLaunchArgument("frontier_min_size", default_value="5"),
+            DeclareLaunchArgument("obstacle_slowdown_dist", default_value="1.5"),
+            DeclareLaunchArgument("safety_dist", default_value="1.5"),
+            DeclareLaunchArgument("pure_rotation_threshold", default_value="1.2"),
+            DeclareLaunchArgument("replan_interval", default_value="2.0"),
+            DeclareLaunchArgument("control_rate", default_value="50.0"),
+            DeclareLaunchArgument("map_publish_interval", default_value="0.5"),
             OpaqueFunction(function=launch_setup),
         ]
     )
