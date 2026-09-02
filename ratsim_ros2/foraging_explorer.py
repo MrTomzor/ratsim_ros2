@@ -48,7 +48,7 @@ from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from std_msgs.msg import Bool, Float32MultiArray, ColorRGBA, Header, Int32
 from visualization_msgs.msg import Marker, MarkerArray
 
-from ratsim_ros2.quadtree import QuadtreeOccupancyGrid
+from ratsim_ros2.quadtree import QuadtreeOccupancyGrid, FREE, OCCUPIED
 
 
 class State(Enum):
@@ -67,7 +67,8 @@ class ForagingExplorer(Node):
         self.declare_parameter("reward_descriptor_index", 2)
         self.declare_parameter("descriptor_dimension", 3)
         self.declare_parameter("max_linear_vel", 10.0)
-        self.declare_parameter("max_angular_vel", 2.0)
+        # 1.5 matches the RL agent's limit (gym env.py) for a fair comparison
+        self.declare_parameter("max_angular_vel", 1.5)
         self.declare_parameter("frontier_min_size", 5)
         self.declare_parameter("obstacle_slowdown_dist", 1.5)
         self.declare_parameter("lookahead_dist", 5.0)     # max; shrinks with speed
@@ -87,6 +88,10 @@ class ForagingExplorer(Node):
         # Within this distance, drive straight at the reward instead of
         # following the planned path (we want to bump it, not stop short)
         self.declare_parameter("reward_approach_dist", 2.0)
+        # Interval replans keep the committed frontier goal unless an
+        # alternative is at least this much closer (fraction of the current
+        # goal's distance) — prevents oscillating between two goals.
+        self.declare_parameter("goal_switch_margin", 0.7)
         self.declare_parameter("control_rate", 50.0)       # Hz
         # Lockstep: drive planning/control from the bridge's /step_end instead
         # of wall timers, and answer every step with /cmd_vel_stamped so the
@@ -114,6 +119,7 @@ class ForagingExplorer(Node):
         self.pure_rotation_threshold = self.get_parameter("pure_rotation_threshold").value
         self.reward_lost_ticks = self.get_parameter("reward_lost_ticks").value
         self.reward_approach_dist = self.get_parameter("reward_approach_dist").value
+        self.goal_switch_margin = self.get_parameter("goal_switch_margin").value
         control_rate = self.get_parameter("control_rate").value
         self.lockstep = self.get_parameter("lockstep").value
 
@@ -126,6 +132,7 @@ class ForagingExplorer(Node):
         self.has_pose = False
         self.current_path: list[tuple[float, float]] = []
         self.path_idx = 0
+        self._committed_goal: tuple[float, float] | None = None
         self.last_replan_time = 0.0
         self.last_map_publish_time = 0.0
         self._replan_requested = False
@@ -275,6 +282,7 @@ class ForagingExplorer(Node):
                 self._latest_descriptors = None
                 self._reward_mask = None
                 self._objects_collected = 0
+                self._committed_goal = None
                 self.state = State.EXPLORE
                 self._replan_requested = True
             else:
@@ -581,9 +589,13 @@ class ForagingExplorer(Node):
         self._plan_to_frontier()
 
     def _plan_to_frontier(self):
-        """Find frontiers, plan A* to the closest reachable one."""
+        """Find frontiers, plan A* to the closest reachable one — but on
+        interval replans, stick with the committed goal while it stays
+        valid (re-selecting nearest-first every interval makes the agent
+        oscillate between goals revealed on either side of it)."""
         # Clear here, not in _maybe_plan: an early-out in _planning_loop
         # (e.g. COLLECT) keeps the request pending.
+        requested = self._replan_requested
         self._replan_requested = False
         self._n_plans += 1
         frontier_cells = self.grid.get_frontier_cells()
@@ -620,6 +632,17 @@ class ForagingExplorer(Node):
         # keeps them from burning the A*-failure budget every cycle.
         comp_labels = self.grid.get_free_components(self.inflation_radius)
         agent_comp = self._agent_component(comp_labels)
+
+        # Goal commitment: an interval replan (path still active) keeps the
+        # committed goal and merely refreshes its path, unless the goal's
+        # frontier is gone (explored away) or an alternative is markedly
+        # closer. Path completion/failure (requested) re-selects freely.
+        if not requested and self._committed_goal is not None:
+            kept = self._replan_committed_goal(
+                frontier_cells, candidates, comp_labels, agent_comp
+            )
+            if kept:
+                return
 
         path = None
         goal_x = goal_y = 0.0
@@ -684,10 +707,12 @@ class ForagingExplorer(Node):
             )
             self._dump_stuck_state(candidates)
             self.current_path = []
+            self._committed_goal = None
             return
 
         self.current_path = path
         self.path_idx = 0
+        self._committed_goal = (goal_x, goal_y)
 
         dist = math.hypot(goal_x - self.agent_x, goal_y - self.agent_y)
         self.get_logger().info(
@@ -699,6 +724,55 @@ class ForagingExplorer(Node):
         self._publish_path(path)
         self._publish_frontiers(clusters)
         self._publish_goal_marker(goal_x, goal_y, r=0.0, g=1.0, b=0.0)
+
+    def _replan_committed_goal(
+        self, frontier_cells, candidates, comp_labels, agent_comp
+    ) -> bool:
+        """Refresh the path to the committed goal. Returns False (letting
+        the caller re-select) when the goal's frontier is explored away,
+        the goal became unreachable, or a candidate is markedly closer."""
+        cgx, cgy = self._committed_goal
+        goal_dist = math.hypot(cgx - self.agent_x, cgy - self.agent_y)
+
+        # Frontier near the goal gone -> its region is explored, move on.
+        cgc, cgr = self.grid.world_to_cell(cgx, cgy)
+        fc = np.array(frontier_cells)
+        r_cells = 2.0 / self.grid_resolution
+        if not np.any(
+            (fc[:, 0] - cgc) ** 2 + (fc[:, 1] - cgr) ** 2 <= r_cells ** 2
+        ):
+            return False
+
+        # A markedly closer candidate wins (hysteresis, not a hard lock).
+        if candidates:
+            ax, ay = candidates[0]
+            if (math.hypot(ax - self.agent_x, ay - self.agent_y)
+                    < self.goal_switch_margin * goal_dist):
+                return False
+
+        retracted = self._retract_goal(cgx, cgy)
+        if retracted is None:
+            return False
+        gx, gy = retracted
+        g_col, g_row = self.grid.world_to_cell(gx, gy)
+        if agent_comp == 0 or int(comp_labels[g_row, g_col]) != agent_comp:
+            return False
+        path = self.grid.astar(
+            self.agent_x, self.agent_y, gx, gy,
+            inflation_radius=self.inflation_radius,
+            clearance=self.path_clearance,
+            clearance_weight=self.path_clearance_weight,
+            max_expansions=self.astar_max_expansions,
+        )
+        if path is None:
+            return False
+
+        self.current_path = path
+        self.path_idx = 0
+        self._committed_goal = (gx, gy)
+        self._publish_path(path)
+        self._publish_goal_marker(gx, gy, r=0.0, g=1.0, b=0.0)
+        return True
 
     def _agent_component(self, comp_labels) -> int:
         """The agent's connected component of known-free space (0 = none).
@@ -754,22 +828,26 @@ class ForagingExplorer(Node):
             self.get_logger().warn(f"Stuck-state dump failed: {e}")
 
     def _retract_goal(self, gx: float, gy: float) -> tuple[float, float] | None:
-        """Move a frontier goal into known-free, non-inflated space.
+        """Move a frontier goal into known-free, non-inflated space WITHOUT
+        crossing occupied cells.
 
-        Steps from the goal toward the agent; if that fails, scans a small
-        box around the goal. Returns None if no known-free, non-inflated
-        cell is found — A* blocks unknown cells, so planning to such a goal
-        would be a guaranteed failure."""
+        Retraction that steps over a wall hands the reachability check a
+        goal on the wrong side, making a frontier patch behind an obstacle
+        look reachable. So: walk toward the agent but stop at the first
+        occupied cell; if that fails, BFS outward from the goal over
+        non-occupied cells (which cannot jump a wall, unlike a box scan).
+        Returns None if no known-free, non-inflated cell is reachable —
+        the candidate is then skipped."""
         inflated = self.grid.get_inflated_grid(self.inflation_radius)
+        raw = self.grid.to_flat_grid()
 
-        def ok(wx, wy):
-            c, r = self.grid.world_to_cell(wx, wy)
-            return self.grid._in_bounds(c, r) and inflated[r, c] == 0  # FREE
-
-        if ok(gx, gy):
+        gc0, gr0 = self.grid.world_to_cell(gx, gy)
+        if not self.grid._in_bounds(gc0, gr0):
+            return None
+        if inflated[gr0, gc0] == FREE:
             return gx, gy
 
-        # Walk toward the agent
+        # Walk toward the agent — stop at the first occupied cell
         dx = self.agent_x - gx
         dy = self.agent_y - gy
         d = math.hypot(dx, dy)
@@ -780,25 +858,33 @@ class ForagingExplorer(Node):
             for i in range(1, n_steps + 1):
                 wx = gx + dx / d * step * i
                 wy = gy + dy / d * step * i
-                if ok(wx, wy):
+                c, r = self.grid.world_to_cell(wx, wy)
+                if not self.grid._in_bounds(c, r) or raw[r, c] == OCCUPIED:
+                    break  # wall in the way — this direction is blocked
+                if inflated[r, c] == FREE:
                     return wx, wy
 
-        # Box scan around the goal, nearest cell first
-        r_cells = int(math.ceil(1.5 / self.grid_resolution))
-        gc, gr = self.grid.world_to_cell(gx, gy)
-        best = None
-        best_d2 = float("inf")
-        for drow in range(-r_cells, r_cells + 1):
-            for dcol in range(-r_cells, r_cells + 1):
-                c, r = gc + dcol, gr + drow
-                if not self.grid._in_bounds(c, r) or inflated[r, c] != 0:
+        # BFS from the goal over non-occupied cells, nearest first.
+        # 4-connected: diagonal cracks between wall cells stay sealed.
+        if raw[gr0, gc0] == OCCUPIED:
+            return None
+        max_r = int(math.ceil(1.5 / self.grid_resolution))
+        visited = {(gc0, gr0)}
+        queue = deque([(gc0, gr0)])
+        while queue:
+            c, r = queue.popleft()
+            if inflated[r, c] == FREE:
+                return self.grid.cell_to_world(c, r)
+            for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nc, nr = c + dc, r + dr
+                if (nc, nr) in visited:
                     continue
-                d2 = drow * drow + dcol * dcol
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best = (c, r)
-        if best is not None:
-            return self.grid.cell_to_world(best[0], best[1])
+                if abs(nc - gc0) > max_r or abs(nr - gr0) > max_r:
+                    continue
+                if not self.grid._in_bounds(nc, nr) or raw[nr, nc] == OCCUPIED:
+                    continue
+                visited.add((nc, nr))
+                queue.append((nc, nr))
         return None
 
     # ------------------------------------------------------------------
