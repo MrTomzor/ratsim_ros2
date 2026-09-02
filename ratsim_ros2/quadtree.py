@@ -202,11 +202,17 @@ class QuadtreeOccupancyGrid:
         angle_start_rad: float,
         angle_increment_rad: float,
         max_range: float,
+        skip_endpoint_mask=None,
     ):
         """Integrate a 2D lidar scan into the occupancy grid.
 
         Rays are cast from the agent position.  Free cells are marked along
         each ray; the endpoint is marked occupied if the range < max_range.
+
+        Rays flagged in skip_endpoint_mask (e.g. hits on reward objects —
+        collectibles, not obstacles) mark their endpoint FREE instead of
+        occupied, so they never enter the map or its inflation; space behind
+        them stays unknown since the ray still ends there.
         """
         self._flat_cache = None
         self._inflated_cache = None
@@ -242,10 +248,20 @@ class QuadtreeOccupancyGrid:
                     if cur != OCCUPIED:  # don't overwrite occupied cells
                         self._set_cell_fast(wx, wy, FREE)
 
+            skip_endpoint = (
+                skip_endpoint_mask is not None
+                and i < len(skip_endpoint_mask)
+                and bool(skip_endpoint_mask[i])
+            )
+
             # Mark endpoint
             if hit and self._in_bounds(end_col, end_row):
                 wx, wy = self.cell_to_world(end_col, end_row)
-                self._set_cell_fast(wx, wy, OCCUPIED)
+                if skip_endpoint:
+                    if self.get_cell(wx, wy) != OCCUPIED:
+                        self._set_cell_fast(wx, wy, FREE)
+                else:
+                    self._set_cell_fast(wx, wy, OCCUPIED)
             elif self._in_bounds(end_col, end_row):
                 # Max range reached — mark as free
                 wx, wy = self.cell_to_world(end_col, end_row)
@@ -343,6 +359,30 @@ class QuadtreeOccupancyGrid:
         self._prox_cache = cost.astype(np.float32)
         self._prox_key = key
         return self._prox_cache
+
+    def clear_footprint(self, wx: float, wy: float, body_radius: float = 0.45):
+        """The robot occupies (wx, wy): its own cell is free evidence, and
+        an OCCUPIED cell whose center lies inside the body radius is a
+        phantom (e.g. a reward object stamped into the map on the tick it
+        was bumped/collected) — clear them to FREE."""
+        self._flat_cache = None
+        self._inflated_cache = None
+        self._prox_cache = None
+        self._comp_cache = None
+        self._set_recursive(self._root, wx, wy, FREE)
+        acol, arow = self.world_to_cell(wx, wy)
+        r_cells = int(math.ceil(body_radius / self.min_resolution))
+        for dr in range(-r_cells, r_cells + 1):
+            for dc in range(-r_cells, r_cells + 1):
+                if dr == 0 and dc == 0:
+                    continue
+                c, r = acol + dc, arow + dr
+                if not self._in_bounds(c, r):
+                    continue
+                cx, cy = self.cell_to_world(c, r)
+                if ((cx - wx) ** 2 + (cy - wy) ** 2 <= body_radius ** 2
+                        and self.get_cell(cx, cy) == OCCUPIED):
+                    self._set_recursive(self._root, cx, cy, FREE)
 
     def get_free_components(self, inflation_radius: float) -> np.ndarray:
         """Label the 8-connected components of inflated-FREE space.

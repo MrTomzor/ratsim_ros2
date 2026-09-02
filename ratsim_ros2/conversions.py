@@ -1,4 +1,5 @@
 import math
+import numpy as np
 from ratsim.roslike_unity_connector.message_definitions import Lidar2DMessage, PoseMessage, TwistMessage
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
@@ -35,7 +36,17 @@ def convert_lidar2d_to_laserscan(msg: Lidar2DMessage, sim_time: float) -> LaserS
     # Flip the ranges because Unity's Lidar2DMessage is in clockwise order
     scan.ranges = list(reversed(msg.ranges))
 
+    # Per-ray semantic class id in intensities (0 = none, class index + 1
+    # otherwise), flipped like the ranges.  Riding in the same message as
+    # the ranges makes the pairing race-free — consumers must not pair
+    # /semantic_lidar with /scan across topics.
     scan.intensities = []
+    n = len(msg.ranges)
+    if msg.descriptors and n > 0 and len(msg.descriptors) % n == 0:
+        dim = len(msg.descriptors) // n
+        desc = np.array(msg.descriptors, dtype=np.float32).reshape(n, dim)
+        cls = np.where(desc.max(axis=1) > 0.5, desc.argmax(axis=1) + 1.0, 0.0)
+        scan.intensities = list(reversed(cls.astype(float).tolist()))
 
     return scan
 

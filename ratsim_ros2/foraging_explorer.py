@@ -45,7 +45,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Point
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
-from std_msgs.msg import Bool, Float32MultiArray, ColorRGBA, Header
+from std_msgs.msg import Bool, Float32MultiArray, ColorRGBA, Header, Int32
 from visualization_msgs.msg import Marker, MarkerArray
 
 from ratsim_ros2.quadtree import QuadtreeOccupancyGrid
@@ -81,6 +81,12 @@ class ForagingExplorer(Node):
         self.declare_parameter("map_publish_interval", 0.5)  # seconds
         self.declare_parameter("safety_dist", 1.5)
         self.declare_parameter("pure_rotation_threshold", 1.2)  # radians (~70 deg)
+        # COLLECT survives this many consecutive frames without a reward hit
+        # (sparse lidar misses small objects, especially at range)
+        self.declare_parameter("reward_lost_ticks", 3)
+        # Within this distance, drive straight at the reward instead of
+        # following the planned path (we want to bump it, not stop short)
+        self.declare_parameter("reward_approach_dist", 2.0)
         self.declare_parameter("control_rate", 50.0)       # Hz
         # Lockstep: drive planning/control from the bridge's /step_end instead
         # of wall timers, and answer every step with /cmd_vel_stamped so the
@@ -106,6 +112,8 @@ class ForagingExplorer(Node):
         self.map_publish_interval = self.get_parameter("map_publish_interval").value
         self.safety_dist = self.get_parameter("safety_dist").value
         self.pure_rotation_threshold = self.get_parameter("pure_rotation_threshold").value
+        self.reward_lost_ticks = self.get_parameter("reward_lost_ticks").value
+        self.reward_approach_dist = self.get_parameter("reward_approach_dist").value
         control_rate = self.get_parameter("control_rate").value
         self.lockstep = self.get_parameter("lockstep").value
 
@@ -126,6 +134,11 @@ class ForagingExplorer(Node):
         self.reward_visible = False
         self.reward_bearing = 0.0  # relative to agent heading
         self.reward_distance = float("inf")
+        self._reward_world: tuple[float, float] | None = None  # last-seen position
+        self._reward_missed_ticks = 0
+        self._latest_descriptors: list | None = None  # this tick's semantic data
+        self._reward_mask = None  # bool per ray (LaserScan order), this tick
+        self._objects_collected = 0
 
         # Lidar data for obstacle checking
         self.latest_scan: LaserScan | None = None
@@ -167,6 +180,7 @@ class ForagingExplorer(Node):
         self.create_subscription(Bool, "/episode_active", self._episode_active_cb, latched_qos)
         self.create_subscription(Odometry, "/odom", self._odom_cb, 10)
         self.create_subscription(LaserScan, "/scan", self._scan_cb, 10)
+        self.create_subscription(Int32, "/objects_collected", self._objects_cb, 10)
         self.create_subscription(
             Float32MultiArray, "/semantic_lidar", self._semantic_cb, 10
         )
@@ -256,6 +270,11 @@ class ForagingExplorer(Node):
                 self._n_reflex_backups = 0
                 self._last_dbg_time = 0.0
                 self._stuck_dumped = False
+                self._reward_world = None
+                self._reward_missed_ticks = 0
+                self._latest_descriptors = None
+                self._reward_mask = None
+                self._objects_collected = 0
                 self.state = State.EXPLORE
                 self._replan_requested = True
             else:
@@ -299,13 +318,13 @@ class ForagingExplorer(Node):
 
         # Integrate any scans that were waiting for this pose
         for _ in range(len(self._pending_scans)):
-            scan = self._pending_scans.popleft()
+            scan, mask = self._pending_scans.popleft()
             s_stamp = (scan.header.stamp.sec, scan.header.stamp.nanosec)
             pose = self._odom_by_stamp.get(s_stamp)
             if pose is not None:
-                self._integrate_scan(scan, pose)
+                self._integrate_scan(scan, pose, mask)
             else:
-                self._pending_scans.append(scan)
+                self._pending_scans.append((scan, mask))
 
         if not prev_has_pose:
             self.get_logger().info(
@@ -313,10 +332,25 @@ class ForagingExplorer(Node):
                 f"yaw={math.degrees(self.agent_yaw):.1f}deg"
             )
 
+    @staticmethod
+    def _is_occlusion_scan(msg: LaserScan) -> bool:
+        """True for the sensor's in-collider fault reading: every ray reports
+        the same short range (occlusionDistance) with zero descriptors —
+        e.g. the tick the agent bumps into a reward object.  That is fault
+        simulation, not geometry; integrating it stamps a permanent ring of
+        phantom obstacles around the bump site."""
+        ranges = np.array(msg.ranges)
+        if len(ranges) == 0 or np.any(ranges <= 0):
+            return False
+        return float(ranges.max() - ranges.min()) < 1e-4 and float(ranges[0]) < 1.0
+
     def _scan_cb(self, msg: LaserScan):
         self.latest_scan = msg
+        self._detect_rewards(msg)
         if self.grid is None:
             return
+        if self._is_occlusion_scan(msg):
+            return  # don't map fault readings
 
         # Log first scan
         if not hasattr(self, '_first_scan_logged'):
@@ -334,15 +368,23 @@ class ForagingExplorer(Node):
         pose = self._odom_by_stamp.get(stamp)
         if pose is None:
             # Same-tick odom not delivered yet — integrate when it arrives
-            self._pending_scans.append(msg)
+            self._pending_scans.append((msg, self._reward_mask))
             return
-        self._integrate_scan(msg, pose)
+        self._integrate_scan(msg, pose, self._reward_mask)
 
-    def _integrate_scan(self, msg: LaserScan, pose: tuple[float, float, float]):
-        """Integrate a scan into the grid using the pose it was sensed at."""
+    def _integrate_scan(
+        self, msg: LaserScan, pose: tuple[float, float, float], reward_mask=None
+    ):
+        """Integrate a scan into the grid using the pose it was sensed at.
+
+        Reward-class rays (reward_mask) never mark obstacles — rewards are
+        collectibles the agent must be able to plan into and bump."""
         if self.grid is None:
             return
         px, py, pyaw = pose
+        # The robot's own footprint is free evidence — clears phantom
+        # obstacles stamped at bump contacts (collected rewards etc.)
+        self.grid.clear_footprint(px, py)
         self.grid.update_from_lidar(
             agent_x=px,
             agent_y=py,
@@ -351,6 +393,7 @@ class ForagingExplorer(Node):
             angle_start_rad=msg.angle_min,
             angle_increment_rad=msg.angle_increment,
             max_range=msg.range_max,
+            skip_endpoint_mask=reward_mask,
         )
 
         # Publish map (throttled)
@@ -360,62 +403,85 @@ class ForagingExplorer(Node):
             self._publish_map()
 
     def _semantic_cb(self, msg: Float32MultiArray):
-        """Check semantic lidar for reward objects."""
-        if not msg.data or self.latest_scan is None:
-            self.reward_visible = False
-            return
+        """Store this tick's descriptors; detection runs at scan time so the
+        mask pairs with the same tick's ranges (the bridge publishes semantic
+        before scan)."""
+        self._latest_descriptors = list(msg.data) if msg.data else None
 
-        scan = self.latest_scan
+    def _reward_not_seen(self):
+        self.reward_visible = False
+        self._reward_missed_ticks += 1
+
+    def _detect_rewards(self, scan: LaserScan):
+        """Detect reward objects in this tick's scan + stored descriptors.
+
+        Sets reward_visible/bearing/distance, the per-ray reward mask (used
+        to keep rewards out of the map and out of obstacle checks), and the
+        last-seen reward world position."""
+        self._reward_mask = None
         n_rays = len(scan.ranges)
-        descriptors = msg.data
-
         if n_rays == 0:
-            self.reward_visible = False
+            self._reward_not_seen()
             return
 
-        # Auto-detect descriptor dimension
-        if len(descriptors) % n_rays != 0:
-            if not hasattr(self, '_desc_mismatch_logged'):
-                self._desc_mismatch_logged = True
-                self.get_logger().warn(
-                    f"Descriptor length {len(descriptors)} not divisible by "
-                    f"n_rays {n_rays}, skipping"
-                )
-            self.reward_visible = False
-            return
-
-        actual_desc_dim = len(descriptors) // n_rays
-        if actual_desc_dim != self.desc_dim:
-            if not hasattr(self, '_desc_dim_logged'):
-                self._desc_dim_logged = True
-                self.get_logger().info(
-                    f"Auto-detected descriptor dimension: {actual_desc_dim} "
-                    f"(was {self.desc_dim})"
-                )
-            self.desc_dim = actual_desc_dim
-
-        if self.reward_desc_idx >= self.desc_dim:
-            if not hasattr(self, '_desc_idx_warn_logged'):
-                self._desc_idx_warn_logged = True
-                self.get_logger().warn(
-                    f"reward_descriptor_index={self.reward_desc_idx} >= "
-                    f"descriptor_dimension={self.desc_dim}, can't detect rewards"
-                )
-            self.reward_visible = False
-            return
-
-        # Reverse descriptor array to match LaserScan ray order
-        desc_array = np.array(descriptors).reshape(n_rays, self.desc_dim)
-        desc_array = desc_array[::-1]
+        # Primary source: per-ray class ids in scan.intensities (0 = none,
+        # class index + 1 otherwise) — same message as the ranges, so the
+        # pairing is race-free. Fallback: /semantic_lidar descriptors
+        # (older bridge; cross-topic ordering not guaranteed).
+        class_mask = None
+        if len(scan.intensities) == n_rays:
+            intens = np.array(scan.intensities)
+            class_mask = intens == float(self.reward_desc_idx + 1)
+        else:
+            descriptors = self._latest_descriptors
+            self._latest_descriptors = None  # consume — never reuse
+            if not descriptors:
+                self._reward_not_seen()
+                return
+            if len(descriptors) % n_rays != 0:
+                if not hasattr(self, '_desc_mismatch_logged'):
+                    self._desc_mismatch_logged = True
+                    self.get_logger().warn(
+                        f"Descriptor length {len(descriptors)} not divisible "
+                        f"by n_rays {n_rays}, skipping"
+                    )
+                self._reward_not_seen()
+                return
+            actual_desc_dim = len(descriptors) // n_rays
+            if actual_desc_dim != self.desc_dim:
+                if not hasattr(self, '_desc_dim_logged'):
+                    self._desc_dim_logged = True
+                    self.get_logger().info(
+                        f"Auto-detected descriptor dimension: {actual_desc_dim} "
+                        f"(was {self.desc_dim})"
+                    )
+                self.desc_dim = actual_desc_dim
+            if self.reward_desc_idx >= self.desc_dim:
+                if not hasattr(self, '_desc_idx_warn_logged'):
+                    self._desc_idx_warn_logged = True
+                    self.get_logger().warn(
+                        f"reward_descriptor_index={self.reward_desc_idx} >= "
+                        f"descriptor_dimension={self.desc_dim}, can't detect rewards"
+                    )
+                self._reward_not_seen()
+                return
+            # Reverse descriptor array to match LaserScan ray order
+            desc_array = np.array(descriptors).reshape(n_rays, self.desc_dim)
+            desc_array = desc_array[::-1]
+            class_mask = desc_array[:, self.reward_desc_idx] > 0.5
 
         ranges = np.array(scan.ranges)
 
-        reward_mask = desc_array[:, self.reward_desc_idx] > 0.5
+        # Integration mask: every reward-class ray, no range cutoff — a
+        # reward hit near max range must not map as an obstacle either.
+        self._reward_mask = class_mask
+
+        # Detection wants stable bearings: valid, non-extreme ranges only.
         valid_range = (ranges > 0) & (ranges < scan.range_max * 0.99)
-        reward_hits = reward_mask & valid_range
+        reward_hits = class_mask & valid_range
 
         if not np.any(reward_hits):
-            self.reward_visible = False
+            self._reward_not_seen()
             return
 
         reward_indices = np.where(reward_hits)[0]
@@ -426,6 +492,17 @@ class ForagingExplorer(Node):
         self.reward_bearing = float(np.average(bearings, weights=weights))
         self.reward_distance = float(np.min(distances))
         self.reward_visible = True
+        self._reward_missed_ticks = 0
+
+        # World position of the nearest reward hit.  agent_x/y/yaw are
+        # same-tick: the bridge publishes odom before scan.
+        j = int(np.argmin(distances))
+        b = float(bearings[j])
+        d = float(distances[j])
+        self._reward_world = (
+            self.agent_x + d * math.cos(self.agent_yaw + b),
+            self.agent_y + d * math.sin(self.agent_yaw + b),
+        )
 
     # ------------------------------------------------------------------
     # Lockstep step handler
@@ -457,7 +534,8 @@ class ForagingExplorer(Node):
                 f"path_rem={path_rem} cmd=({self._last_cmd[0]:.2f},{self._last_cmd[1]:.2f}) "
                 f"minfront={self._get_min_front_range():.1f} "
                 f"plans={self._n_plans} fails={self._n_plan_failures} "
-                f"goals={self._n_goals_reached} backups={self._n_reflex_backups}"
+                f"goals={self._n_goals_reached} backups={self._n_reflex_backups} "
+                f"obj={self._objects_collected}"
             )
 
         reply = TwistStamped()
@@ -492,8 +570,12 @@ class ForagingExplorer(Node):
         if not self.has_pose or self.grid is None:
             return
 
-        # In COLLECT state, don't replan frontiers — just follow reward
+        # In COLLECT state, replan toward the reward, not frontiers — the
+        # position refines with each new sighting.
         if self.state == State.COLLECT:
+            if not self._plan_to_reward():
+                self.get_logger().info("Reward unreachable -> EXPLORE")
+                self._exit_collect()
             return
 
         self._plan_to_frontier()
@@ -537,24 +619,7 @@ class ForagingExplorer(Node):
         # e.g. free-cell islands leaked behind walls.  Skipping them here
         # keeps them from burning the A*-failure budget every cycle.
         comp_labels = self.grid.get_free_components(self.inflation_radius)
-        a_col, a_row = self.grid.world_to_cell(self.agent_x, self.agent_y)
-        agent_comp = 0
-        if self.grid._in_bounds(a_col, a_row):
-            agent_comp = int(comp_labels[a_row, a_col])
-        if agent_comp == 0:
-            # Agent sits in the inflated band (or an unscanned cell) — use
-            # the nearest free cell's component, mirroring the A* escape set.
-            esc = int(math.ceil(self.inflation_radius / self.grid_resolution)) + 1
-            best_d2 = None
-            for dr in range(-esc, esc + 1):
-                for dc in range(-esc, esc + 1):
-                    c, r = a_col + dc, a_row + dr
-                    d2 = dr * dr + dc * dc
-                    if (d2 <= esc * esc and self.grid._in_bounds(c, r)
-                            and comp_labels[r, c] != 0
-                            and (best_d2 is None or d2 < best_d2)):
-                        best_d2 = d2
-                        agent_comp = int(comp_labels[r, c])
+        agent_comp = self._agent_component(comp_labels)
 
         path = None
         goal_x = goal_y = 0.0
@@ -635,6 +700,36 @@ class ForagingExplorer(Node):
         self._publish_frontiers(clusters)
         self._publish_goal_marker(goal_x, goal_y, r=0.0, g=1.0, b=0.0)
 
+    def _agent_component(self, comp_labels) -> int:
+        """The agent's connected component of known-free space (0 = none).
+
+        If the agent's own cell is not free (inflated band / unscanned),
+        use the nearest free cell's component. The search radius must
+        comfortably exceed the inflation radius: a phantom obstacle near
+        the agent pushes the nearest free cell out by its whole inflation
+        ring, and returning 0 here makes every goal look unreachable."""
+        a_col, a_row = self.grid.world_to_cell(self.agent_x, self.agent_y)
+        if self.grid._in_bounds(a_col, a_row):
+            comp = int(comp_labels[a_row, a_col])
+            if comp != 0:
+                return comp
+        esc = max(
+            int(math.ceil(self.inflation_radius / self.grid_resolution)) + 1,
+            int(math.ceil(1.5 / self.grid_resolution)),
+        )
+        best_d2 = None
+        agent_comp = 0
+        for dr in range(-esc, esc + 1):
+            for dc in range(-esc, esc + 1):
+                c, r = a_col + dc, a_row + dr
+                d2 = dr * dr + dc * dc
+                if (d2 <= esc * esc and self.grid._in_bounds(c, r)
+                        and comp_labels[r, c] != 0
+                        and (best_d2 is None or d2 < best_d2)):
+                    best_d2 = d2
+                    agent_comp = int(comp_labels[r, c])
+        return agent_comp
+
     def _dump_stuck_state(self, candidates) -> None:
         """One-shot per episode: save the grid + candidates when a planning
         cycle fails completely, for offline analysis."""
@@ -714,73 +809,145 @@ class ForagingExplorer(Node):
         if self.state == State.WAITING or not self.has_pose or self.grid is None:
             return
 
-        # Check for reward objects → transition to COLLECT
+        # Check for reward objects → transition to COLLECT (only if the
+        # reward is reachable through known-free space; otherwise keep
+        # exploring until the connecting corridor is mapped)
         if self.reward_visible and self.state == State.EXPLORE:
-            self.state = State.COLLECT
-            self.get_logger().info(
-                f"Reward spotted! bearing={math.degrees(self.reward_bearing):.1f}deg "
-                f"dist={self.reward_distance:.1f}m -> COLLECT"
-            )
+            if self._plan_to_reward():
+                self.state = State.COLLECT
+                self.get_logger().info(
+                    f"Reward spotted! bearing={math.degrees(self.reward_bearing):.1f}deg "
+                    f"dist={self.reward_distance:.1f}m -> COLLECT"
+                )
 
         if self.state == State.COLLECT:
             self._do_collect()
         elif self.state == State.EXPLORE:
             self._do_explore()
 
+    def _exit_collect(self):
+        """Back to EXPLORE; forget the reward and ask for a frontier plan."""
+        self.state = State.EXPLORE
+        self._reward_world = None
+        self._reward_missed_ticks = 0
+        self.current_path = []
+        self.path_idx = 0
+        self._replan_requested = True
+
+    def _objects_cb(self, msg: Int32):
+        prev = self._objects_collected
+        self._objects_collected = msg.data
+        if msg.data > prev and self.state == State.COLLECT:
+            self.get_logger().info(
+                f"Reward collected! total={msg.data} -> EXPLORE"
+            )
+            self._exit_collect()
+
     def _do_collect(self):
-        """Pure-pursuit toward reward bearing."""
-        if not self.reward_visible:
-            self.get_logger().info("Reward no longer visible -> EXPLORE")
-            self.state = State.EXPLORE
-            self.current_path = []
-            self._replan_requested = True
+        """Navigate into the last-seen reward: planned path while far,
+        direct chase inside reward_approach_dist (we want to bump it).
+        Gives up after reward_lost_ticks consecutive frames without a
+        sighting — the sparse lidar misses small objects routinely."""
+        if (self._reward_world is None
+                or self._reward_missed_ticks > self.reward_lost_ticks):
+            self.get_logger().info(
+                f"Reward lost ({self._reward_missed_ticks} ticks) -> EXPLORE"
+            )
+            self._exit_collect()
+            self._publish_zero_vel()
             return
 
-        # Treat the reward as a virtual lookahead point in local frame
-        angle_error = self.reward_bearing
-        d_l = max(self.reward_distance, 0.1)
+        rx, ry = self._reward_world
+        dx = rx - self.agent_x
+        dy = ry - self.agent_y
+        dist = math.hypot(dx, dy)
 
-        # Pure rotation if reward is far off to the side
+        if dist > self.reward_approach_dist:
+            # Far: follow the planned path (replanned on the usual interval
+            # as sightings refine the reward position)
+            if not self.current_path:
+                if not self._plan_to_reward():
+                    self.get_logger().info("Reward unreachable -> EXPLORE")
+                    self._exit_collect()
+                    self._publish_zero_vel()
+                    return
+            self._follow_path_step()
+            return
+
+        # Close: drive straight at the last-known point — no goal radius,
+        # the collision with the object IS the goal.
+        angle_error = math.atan2(dy, dx) - self.agent_yaw
+        angle_error = (angle_error + math.pi) % (2.0 * math.pi) - math.pi
+
         if abs(angle_error) > self.pure_rotation_threshold:
             omega = self.max_angular_vel if angle_error > 0 else -self.max_angular_vel
             self._publish_vel(0.0, omega)
         else:
-            # Lateral offset in robot-local frame
+            d_l = max(dist, 0.1)
             delta_y = d_l * math.sin(angle_error)
-
-            # Pure pursuit: ω = 2·v·Δy / d_l²
             alignment = max(0.0, math.cos(angle_error))
             v = self.max_linear_vel * (0.3 + 0.7 * alignment)
             omega = 2.0 * v * delta_y / (d_l * d_l)
             omega = self._clamp(omega, -self.max_angular_vel, self.max_angular_vel)
-
-            # Obstacle check
+            # Obstacle check still applies — reward rays are excluded from it
             linear_x, omega = self._apply_obstacle_avoidance(v, omega)
-
             self._publish_vel(linear_x, omega)
 
-        # Publish goal marker
-        reward_wx = self.agent_x + self.reward_distance * math.cos(
-            self.agent_yaw + self.reward_bearing
+        self._publish_goal_marker(rx, ry, r=1.0, g=0.8, b=0.0)
+
+    def _plan_to_reward(self) -> bool:
+        """Plan a path to the last-seen reward position. False when the
+        reward is not (yet) reachable through known-free space."""
+        if self._reward_world is None or self.grid is None or not self.has_pose:
+            return False
+        self._replan_requested = False
+        rx, ry = self._reward_world
+        retracted = self._retract_goal(rx, ry)
+        if retracted is None:
+            return False
+        gx, gy = retracted
+        comp_labels = self.grid.get_free_components(self.inflation_radius)
+        agent_comp = self._agent_component(comp_labels)
+        g_col, g_row = self.grid.world_to_cell(gx, gy)
+        if agent_comp == 0 or int(comp_labels[g_row, g_col]) != agent_comp:
+            return False
+        path = self.grid.astar(
+            self.agent_x, self.agent_y, gx, gy,
+            inflation_radius=self.inflation_radius,
+            clearance=self.path_clearance,
+            clearance_weight=self.path_clearance_weight,
+            max_expansions=self.astar_max_expansions,
         )
-        reward_wy = self.agent_y + self.reward_distance * math.sin(
-            self.agent_yaw + self.reward_bearing
-        )
-        self._publish_goal_marker(reward_wx, reward_wy, r=1.0, g=0.8, b=0.0)
+        if path is None:
+            return False
+        self.current_path = path
+        self.path_idx = 0
+        self._publish_path(path)
+        self._publish_goal_marker(gx, gy, r=1.0, g=0.8, b=0.0)
+        return True
 
     def _do_explore(self):
-        """Pure-pursuit (carrot-on-a-stick) path following."""
+        """Frontier path following: stop within goal_reached_dist of the
+        path end (the retracted goal sits in free space, no need to defend
+        the last meter), otherwise pure-pursuit along the path."""
         if not self.current_path:
             self._publish_zero_vel()
             return
 
-        # Goal reached when within goal_reached_dist of the path's end — the
-        # retracted goal sits in free space, no need to defend the last meter.
         end_x, end_y = self.current_path[-1]
         if math.hypot(end_x - self.agent_x, end_y - self.agent_y) < self.goal_reached_dist:
             self._n_goals_reached += 1
             self.current_path = []
             self._replan_requested = True
+            self._publish_zero_vel()
+            return
+
+        self._follow_path_step()
+
+    def _follow_path_step(self):
+        """Pure-pursuit (carrot-on-a-stick) along current_path. Shared by
+        EXPLORE (with a goal-reached stop) and COLLECT (without one)."""
+        if not self.current_path:
             self._publish_zero_vel()
             return
 
@@ -913,12 +1080,15 @@ class ForagingExplorer(Node):
         if self.latest_scan is None:
             return self.max_angular_vel
         scan = self.latest_scan
+        mask = self._reward_mask  # same-tick, LaserScan ray order
         # Sum up inverse-range contributions from left vs right
         left_weight = 0.0
         right_weight = 0.0
         for i, r in enumerate(scan.ranges):
             if r <= 0:
                 continue
+            if mask is not None and i < len(mask) and mask[i]:
+                continue  # rewards are collectibles, not obstacles
             angle = scan.angle_min + i * scan.angle_increment
             w = 1.0 / (r + 0.1)
             if angle > 0:
@@ -935,9 +1105,12 @@ class ForagingExplorer(Node):
         if self.latest_scan is None:
             return float("inf")
         scan = self.latest_scan
+        mask = self._reward_mask  # same-tick, LaserScan ray order
         min_range = float("inf")
         cone_half = math.radians(30)
         for i, r in enumerate(scan.ranges):
+            if mask is not None and i < len(mask) and mask[i]:
+                continue  # rewards are collectibles, not obstacles
             angle = scan.angle_min + i * scan.angle_increment
             if abs(angle) <= cone_half and r > 0:
                 min_range = min(min_range, r)

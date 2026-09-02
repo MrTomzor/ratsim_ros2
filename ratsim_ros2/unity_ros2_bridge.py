@@ -41,7 +41,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from geometry_msgs.msg import Twist, TwistStamped, TransformStamped
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, Float32MultiArray, String, Header
+from std_msgs.msg import Bool, Float32MultiArray, Int32, String, Header
 from rosgraph_msgs.msg import Clock
 from std_srvs.srv import Trigger
 from builtin_interfaces.msg import Time
@@ -151,6 +151,7 @@ class UnityRos2Bridge(Node):
         self.pub_odom = self.create_publisher(Odometry, "/odom", 10)
         self.pub_clock = self.create_publisher(Clock, "/clock", 10)
         self.pub_semantic = self.create_publisher(Float32MultiArray, "/semantic_lidar", 10)
+        self.pub_objects = self.create_publisher(Int32, "/objects_collected", 10)
 
         # Latched (transient local) topics
         latched_qos = QoSProfile(
@@ -467,17 +468,23 @@ class UnityRos2Bridge(Node):
             t.transform.rotation.w = pose_msg.qw if pose_msg.qw else 1.0
             self.tf_broadcaster.sendTransform(t)
 
-        # Publish scan
+        # Publish objects-collected count (explorer exits COLLECT on increment)
+        obj_msg = Int32()
+        obj_msg.data = int(self.task_tracker.get_num_reward_objs_picked_up())
+        self.pub_objects.publish(obj_msg)
+
+        # Publish semantic lidar BEFORE scan: consumers store the descriptor
+        # mask and apply it to the same tick's scan on arrival.
         if "/lidar2d" in msgs:
             lidar_msg = msgs["/lidar2d"][0]
-            ros_scan = convert_lidar2d_to_laserscan(lidar_msg, sim_time)
-            self.pub_scan.publish(ros_scan)
 
-            # Publish semantic lidar (raw descriptors)
             if lidar_msg.descriptors is not None:
                 sem_msg = Float32MultiArray()
                 sem_msg.data = [float(d) for d in lidar_msg.descriptors]
                 self.pub_semantic.publish(sem_msg)
+
+            ros_scan = convert_lidar2d_to_laserscan(lidar_msg, sim_time)
+            self.pub_scan.publish(ros_scan)
 
         # End-of-batch marker. Arm the handshake BEFORE publishing so a fast
         # reply can't slip past the wait.
