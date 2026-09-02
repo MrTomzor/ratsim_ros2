@@ -78,7 +78,10 @@ class ForagingExplorer(Node):
         self.declare_parameter("path_clearance", 1.0)      # prefer cells this far from walls
         self.declare_parameter("path_clearance_weight", 3.0)
         self.declare_parameter("curve_speed_margin", 0.9)  # fraction of max omega usable via v*kappa
-        self.declare_parameter("astar_max_expansions", 60000)  # cap per A* call (~1s worst case)
+        # Cap per A* call (~1s worst case). A*-only: euclidean-mode goal
+        # search and reward planning. The frontier flood is deliberately
+        # uncapped — a cap there turns into a hard exploration range.
+        self.declare_parameter("astar_max_expansions", 60000)
         self.declare_parameter("replan_interval", 2.0)     # seconds
         self.declare_parameter("map_publish_interval", 0.5)  # seconds
         self.declare_parameter("safety_dist", 1.5)
@@ -653,13 +656,28 @@ class ForagingExplorer(Node):
         never get a finite cost, and the winning path falls out of the
         flood's parent pointers, so the per-candidate A* loop, the
         connected-component filter and goal retraction are all
-        unnecessary here."""
+        unnecessary here.
+
+        The flood is UNCAPPED (an expansion cap turns into a hard
+        exploration range — beyond it every frontier looks unreachable
+        and the agent parks with frontiers still on the map) but stops
+        early once every cluster (and the committed goal) has a settled
+        cell, so it normally pays only for the region out to the
+        cheapest frontiers, not for the whole map."""
+        targets = [self._cluster_target_cells(c) for c in clusters]
+        groups = list(targets)
+        committed_cells = None
+        if self._committed_goal is not None:
+            cgc, cgr = self.grid.world_to_cell(*self._committed_goal)
+            committed_cells = self._box_cells(cgc, cgr)
+            groups.append(committed_cells)
+
         field, parent = self.grid.dijkstra_field(
             self.agent_x, self.agent_y,
             inflation_radius=self.inflation_radius,
             clearance=self.path_clearance,
             clearance_weight=self.path_clearance_weight,
-            max_expansions=self.astar_max_expansions,
+            target_groups=groups,
         )
 
         # Goals already within reach are useless — "arriving" at one
@@ -669,8 +687,8 @@ class ForagingExplorer(Node):
         scored = []  # (path_cost, (col, row), goal_x, goal_y)
         n_unreached = 0
         n_too_close = 0
-        for cluster in clusters:
-            cost, cell = self._cluster_path_cost(field, cluster)
+        for cluster_targets in targets:
+            cost, cell = self._min_cost_cell(field, cluster_targets)
             if cell is None:
                 n_unreached += 1
                 continue
@@ -683,7 +701,7 @@ class ForagingExplorer(Node):
 
         if not requested and self._committed_goal is not None:
             kept = self._keep_committed_floodfill(
-                frontier_cells, field, parent,
+                frontier_cells, field, parent, committed_cells,
                 scored[0][0] if scored else None,
             )
             if kept:
@@ -728,63 +746,50 @@ class ForagingExplorer(Node):
         self._publish_frontiers(clusters)
         self._publish_goal_marker(goal_x, goal_y, r=0.0, g=1.0, b=0.0)
 
-    def _cluster_path_cost(self, field, cluster):
-        """Cheapest flood cost over a cluster's cells, with the cell that
-        achieves it.  Frontier cells hugging a wall sit inside the
-        inflated band and are never flooded, so when no cluster cell was
-        reached, fall back to the cheapest reached cell within about one
-        inflation radius of the cluster (by construction that cell is on
-        the agent's side of any wall).  Returns (cost, (col, row)) or
-        (inf, None) when nothing nearby was reached."""
+    def _box_cells(self, col, row, rad=None):
+        """In-bounds cells within Chebyshev distance `rad` of (col, row);
+        default rad covers one inflation radius plus a cell."""
+        if rad is None:
+            rad = int(math.ceil(self.inflation_radius / self.grid_resolution)) + 1
+        cells = set()
+        for dr in range(-rad, rad + 1):
+            for dc in range(-rad, rad + 1):
+                nc, nr = col + dc, row + dr
+                if self.grid._in_bounds(nc, nr):
+                    cells.add((nc, nr))
+        return cells
+
+    def _cluster_target_cells(self, cluster):
+        """The cells whose flood cost can 'reach' a cluster: its own
+        cells plus a one-inflation-radius neighborhood.  Frontier cells
+        hugging a wall sit inside the inflated band and are never
+        flooded, so the neighborhood is what makes such a cluster
+        reachable — and by construction a reached neighborhood cell is
+        on the agent's side of any wall.  The same set serves as the
+        flood's early-exit target group and as the read set for
+        _min_cost_cell, which keeps early exit exact."""
+        cells = set()
+        for c, r in cluster:
+            cells |= self._box_cells(c, r)
+        return cells
+
+    @staticmethod
+    def _min_cost_cell(field, cells):
+        """Cheapest flood cost over a set of cells, with its argmin.
+        Returns (cost, (col, row)) or (inf, None) if none was reached."""
         best = math.inf
         best_cell = None
-        for c, r in cluster:
+        for c, r in cells:
             v = field[r, c]
             if v < best:
                 best = v
                 best_cell = (c, r)
-        if best_cell is not None:
-            return float(best), best_cell
-        rad = int(math.ceil(self.inflation_radius / self.grid_resolution)) + 1
-        for c, r in cluster:
-            for dr in range(-rad, rad + 1):
-                for dc in range(-rad, rad + 1):
-                    nc, nr = c + dc, r + dr
-                    if not self.grid._in_bounds(nc, nr):
-                        continue
-                    v = field[nr, nc]
-                    if v < best:
-                        best = v
-                        best_cell = (nc, nr)
-        if best_cell is None:
-            return math.inf, None
-        return float(best), best_cell
-
-    def _point_path_cost(self, field, col, row):
-        """Flood cost at one cell, falling back to the cheapest reached
-        cell within one inflation radius (a committed goal can slip into
-        the inflated band when a newer scan fattens a wall).  Returns
-        (cost, (col, row)) or (inf, None)."""
-        if self.grid._in_bounds(col, row) and math.isfinite(field[row, col]):
-            return float(field[row, col]), (col, row)
-        rad = int(math.ceil(self.inflation_radius / self.grid_resolution)) + 1
-        best = math.inf
-        best_cell = None
-        for dr in range(-rad, rad + 1):
-            for dc in range(-rad, rad + 1):
-                nc, nr = col + dc, row + dr
-                if not self.grid._in_bounds(nc, nr):
-                    continue
-                v = field[nr, nc]
-                if v < best:
-                    best = v
-                    best_cell = (nc, nr)
         if best_cell is None:
             return math.inf, None
         return float(best), best_cell
 
     def _keep_committed_floodfill(
-        self, frontier_cells, field, parent, best_cost
+        self, frontier_cells, field, parent, committed_cells, best_cost
     ) -> bool:
         """Goal commitment, path-cost edition: refresh the path to the
         committed goal from the flood's parent pointers.  Returns False
@@ -803,7 +808,7 @@ class ForagingExplorer(Node):
         ):
             return False
 
-        cost, cell = self._point_path_cost(field, cgc, cgr)
+        cost, cell = self._min_cost_cell(field, committed_cells)
         if cell is None:
             return False
         if best_cost is not None and best_cost < self.goal_switch_margin * cost:

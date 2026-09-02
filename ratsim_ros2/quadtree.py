@@ -618,6 +618,7 @@ class QuadtreeOccupancyGrid:
         clearance: float = 0.0,
         clearance_weight: float = 0.0,
         max_expansions: int = 0,
+        target_groups: Optional[List] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Single-source Dijkstra flood over known-FREE space.
 
@@ -630,10 +631,20 @@ class QuadtreeOccupancyGrid:
         rank many candidate goals by path length instead of euclidean
         distance and extract any path via path_from_field().
 
+        target_groups (optional): a list of groups of (col, row) cells.
+        The flood stops early once every group has at least one SETTLED
+        cell (groups with no in-bounds cell are ignored; groups that are
+        wholly unreachable just let the flood run to exhaustion, which is
+        bounded by the reachable region).  Dijkstra settles cells in
+        nondecreasing cost order, so each group's first settled cell IS
+        its cheapest — per-group minima read from the returned field are
+        exact even under early exit.  Other cells may hold tentative
+        costs: valid paths via `parent`, but possibly not optimal ones.
+
         Returns (cost, parent):
           cost:   float64 (cells_y, cells_x); path cost in cell units
                   (orthogonal step 1.0, diagonal 1.414, plus clearance /
-                  escape penalties); np.inf where unreachable.
+                  escape penalties); np.inf where unreached.
           parent: int32 flat indices (row * cells_x + col) of each reached
                   cell's predecessor; -1 = unreached; the start cell is
                   its own parent.
@@ -670,6 +681,16 @@ class QuadtreeOccupancyGrid:
             (-1, -1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (1, 1, 1.414),
         ]
 
+        # Early-exit bookkeeping: map flat cell index -> group ids
+        cell_groups: dict[int, list[int]] = {}
+        unsatisfied: set[int] = set()
+        if target_groups:
+            for gi, cells in enumerate(target_groups):
+                for c, r in cells:
+                    if self._in_bounds(c, r):
+                        cell_groups.setdefault(r * self.cells_x + c, []).append(gi)
+                        unsatisfied.add(gi)
+
         cost[sr, sc] = 0.0
         parent[sr, sc] = sr * self.cells_x + sc
         open_set = [(0.0, sc, sr)]
@@ -681,6 +702,12 @@ class QuadtreeOccupancyGrid:
             expansions += 1
             if max_expansions and expansions > max_expansions:
                 break
+            if unsatisfied:
+                gis = cell_groups.get(cr * self.cells_x + cc)
+                if gis:
+                    unsatisfied.difference_update(gis)
+                    if not unsatisfied:
+                        break
             for dc, dr, step in neighbors:
                 nc, nr = cc + dc, cr + dr
                 if not self._in_bounds(nc, nr):
