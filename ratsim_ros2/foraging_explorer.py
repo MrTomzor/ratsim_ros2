@@ -2,10 +2,11 @@
 """Foraging exploration node.
 
 Pure ROS2 node (no ratsim dependency) that builds an occupancy map from
-lidar, detects frontiers, plans paths with A*, and follows them using
-pure-pursuit (carrot-on-a-stick) path following.  When a reward object is
-detected via semantic lidar descriptors, the agent switches to COLLECT
-mode and approaches the reward.
+lidar, detects frontiers, picks the goal by path cost from a Dijkstra
+flood (or by euclidean distance + A*, goal_selection:=euclidean), and
+follows the path using pure-pursuit (carrot-on-a-stick) path following.
+When a reward object is detected via semantic lidar descriptors, the
+agent switches to COLLECT mode and approaches the reward.
 
 Architecture, free mode (default): two wall timers at different rates:
   - Planning tick (4Hz): replans immediately when the current path is
@@ -90,8 +91,18 @@ class ForagingExplorer(Node):
         self.declare_parameter("reward_approach_dist", 2.0)
         # Interval replans keep the committed frontier goal unless an
         # alternative is at least this much closer (fraction of the current
-        # goal's distance) — prevents oscillating between two goals.
+        # goal's distance — euclidean or path cost per goal_selection) —
+        # prevents oscillating between two goals.
         self.declare_parameter("goal_switch_margin", 0.7)
+        # How the next frontier goal is picked:
+        #   "floodfill" — one Dijkstra flood from the agent; cheapest PATH
+        #                 cost wins (a frontier across a wall is near in a
+        #                 straight line but far by path, so no corridor
+        #                 hopping)
+        #   "euclidean" — rank centroids by straight-line distance, A* to
+        #                 the first reachable one (cheaper per cycle,
+        #                 worse goal choices)
+        self.declare_parameter("goal_selection", "floodfill")
         self.declare_parameter("control_rate", 50.0)       # Hz
         # Lockstep: drive planning/control from the bridge's /step_end instead
         # of wall timers, and answer every step with /cmd_vel_stamped so the
@@ -120,6 +131,12 @@ class ForagingExplorer(Node):
         self.reward_lost_ticks = self.get_parameter("reward_lost_ticks").value
         self.reward_approach_dist = self.get_parameter("reward_approach_dist").value
         self.goal_switch_margin = self.get_parameter("goal_switch_margin").value
+        self.goal_selection = self.get_parameter("goal_selection").value
+        if self.goal_selection not in ("floodfill", "euclidean"):
+            self.get_logger().warn(
+                f"Unknown goal_selection '{self.goal_selection}', using floodfill"
+            )
+            self.goal_selection = "floodfill"
         control_rate = self.get_parameter("control_rate").value
         self.lockstep = self.get_parameter("lockstep").value
 
@@ -589,10 +606,15 @@ class ForagingExplorer(Node):
         self._plan_to_frontier()
 
     def _plan_to_frontier(self):
-        """Find frontiers, plan A* to the closest reachable one — but on
-        interval replans, stick with the committed goal while it stays
-        valid (re-selecting nearest-first every interval makes the agent
-        oscillate between goals revealed on either side of it)."""
+        """Find frontiers and plan a path to the best cluster.
+
+        Goal selection (`goal_selection` param): "floodfill" (default)
+        ranks clusters by PATH cost from one Dijkstra flood;
+        "euclidean" ranks centroids by straight-line distance and runs
+        A* per candidate.  Both modes stick with the committed goal on
+        interval replans while it stays valid (re-selecting every
+        interval makes the agent oscillate between goals revealed on
+        either side of it)."""
         # Clear here, not in _maybe_plan: an early-out in _planning_loop
         # (e.g. COLLECT) keeps the request pending.
         requested = self._replan_requested
@@ -612,7 +634,198 @@ class ForagingExplorer(Node):
             self._publish_frontiers([])
             return
 
-        # Try clusters closest-first until one is reachable
+        if self.goal_selection == "euclidean":
+            self._select_goal_euclidean(requested, frontier_cells, clusters)
+        else:
+            self._select_goal_floodfill(requested, frontier_cells, clusters)
+
+    # ---- floodfill goal selection (default) --------------------------
+
+    def _select_goal_floodfill(self, requested, frontier_cells, clusters):
+        """Pick the frontier cluster with the cheapest PATH cost.
+
+        One Dijkstra flood from the agent yields the exact path cost to
+        every reachable cell (same traversability and costs as A*), so
+        clusters are ranked by how far they really are to drive, not by
+        straight-line distance — a frontier in the corridor next door is
+        euclidean-near but path-far, and no longer steals the goal.
+        Unreachable clusters (behind walls, free-cell islands) simply
+        never get a finite cost, and the winning path falls out of the
+        flood's parent pointers, so the per-candidate A* loop, the
+        connected-component filter and goal retraction are all
+        unnecessary here."""
+        field, parent = self.grid.dijkstra_field(
+            self.agent_x, self.agent_y,
+            inflation_radius=self.inflation_radius,
+            clearance=self.path_clearance,
+            clearance_weight=self.path_clearance_weight,
+            max_expansions=self.astar_max_expansions,
+        )
+
+        # Goals already within reach are useless — "arriving" at one
+        # clears nothing and would loop plan->reached->plan in place.
+        min_goal_dist = self.goal_reached_dist + self.min_lookahead
+
+        scored = []  # (path_cost, (col, row), goal_x, goal_y)
+        n_unreached = 0
+        n_too_close = 0
+        for cluster in clusters:
+            cost, cell = self._cluster_path_cost(field, cluster)
+            if cell is None:
+                n_unreached += 1
+                continue
+            gx, gy = self.grid.cell_to_world(cell[0], cell[1])
+            if math.hypot(gx - self.agent_x, gy - self.agent_y) < min_goal_dist:
+                n_too_close += 1
+                continue
+            scored.append((cost, cell, gx, gy))
+        scored.sort(key=lambda s: s[0])
+
+        if not requested and self._committed_goal is not None:
+            kept = self._keep_committed_floodfill(
+                frontier_cells, field, parent,
+                scored[0][0] if scored else None,
+            )
+            if kept:
+                return
+
+        if not scored:
+            self._n_plan_failures += 1
+            self.get_logger().info(
+                f"No plan: {len(clusters)} clusters "
+                f"({n_too_close} within {min_goal_dist:.1f}m, "
+                f"{n_unreached} unreached by flood)."
+            )
+            centroids = []
+            for c in clusters:
+                cc, cr = QuadtreeOccupancyGrid.cluster_centroid(c)
+                centroids.append(self.grid.cell_to_world(int(cc), int(cr)))
+            self._dump_stuck_state(centroids)
+            self.current_path = []
+            self._committed_goal = None
+            return
+
+        cost, cell, goal_x, goal_y = scored[0]
+        path = self.grid.path_from_field(parent, cell[0], cell[1])
+        if path is None:  # cannot happen for a reached cell; stay safe
+            self._n_plan_failures += 1
+            self.current_path = []
+            self._committed_goal = None
+            return
+
+        self.current_path = path
+        self.path_idx = 0
+        self._committed_goal = (goal_x, goal_y)
+
+        dist = math.hypot(goal_x - self.agent_x, goal_y - self.agent_y)
+        self.get_logger().info(
+            f"Planned path to frontier ({goal_x:.0f}, {goal_y:.0f}), "
+            f"{len(path)} waypoints, dist={dist:.0f}m, "
+            f"cost={cost * self.grid_resolution:.0f}, "
+            f"{len(clusters)} clusters"
+        )
+        self._publish_path(path)
+        self._publish_frontiers(clusters)
+        self._publish_goal_marker(goal_x, goal_y, r=0.0, g=1.0, b=0.0)
+
+    def _cluster_path_cost(self, field, cluster):
+        """Cheapest flood cost over a cluster's cells, with the cell that
+        achieves it.  Frontier cells hugging a wall sit inside the
+        inflated band and are never flooded, so when no cluster cell was
+        reached, fall back to the cheapest reached cell within about one
+        inflation radius of the cluster (by construction that cell is on
+        the agent's side of any wall).  Returns (cost, (col, row)) or
+        (inf, None) when nothing nearby was reached."""
+        best = math.inf
+        best_cell = None
+        for c, r in cluster:
+            v = field[r, c]
+            if v < best:
+                best = v
+                best_cell = (c, r)
+        if best_cell is not None:
+            return float(best), best_cell
+        rad = int(math.ceil(self.inflation_radius / self.grid_resolution)) + 1
+        for c, r in cluster:
+            for dr in range(-rad, rad + 1):
+                for dc in range(-rad, rad + 1):
+                    nc, nr = c + dc, r + dr
+                    if not self.grid._in_bounds(nc, nr):
+                        continue
+                    v = field[nr, nc]
+                    if v < best:
+                        best = v
+                        best_cell = (nc, nr)
+        if best_cell is None:
+            return math.inf, None
+        return float(best), best_cell
+
+    def _point_path_cost(self, field, col, row):
+        """Flood cost at one cell, falling back to the cheapest reached
+        cell within one inflation radius (a committed goal can slip into
+        the inflated band when a newer scan fattens a wall).  Returns
+        (cost, (col, row)) or (inf, None)."""
+        if self.grid._in_bounds(col, row) and math.isfinite(field[row, col]):
+            return float(field[row, col]), (col, row)
+        rad = int(math.ceil(self.inflation_radius / self.grid_resolution)) + 1
+        best = math.inf
+        best_cell = None
+        for dr in range(-rad, rad + 1):
+            for dc in range(-rad, rad + 1):
+                nc, nr = col + dc, row + dr
+                if not self.grid._in_bounds(nc, nr):
+                    continue
+                v = field[nr, nc]
+                if v < best:
+                    best = v
+                    best_cell = (nc, nr)
+        if best_cell is None:
+            return math.inf, None
+        return float(best), best_cell
+
+    def _keep_committed_floodfill(
+        self, frontier_cells, field, parent, best_cost
+    ) -> bool:
+        """Goal commitment, path-cost edition: refresh the path to the
+        committed goal from the flood's parent pointers.  Returns False
+        (letting the caller re-select) when the goal's frontier is
+        explored away, the goal became unreachable, or an alternative's
+        PATH cost is markedly cheaper — euclidean margins let a frontier
+        just across a wall trigger a switch; path costs don't."""
+        cgx, cgy = self._committed_goal
+        cgc, cgr = self.grid.world_to_cell(cgx, cgy)
+
+        # Frontier near the goal gone -> its region is explored, move on.
+        fc = np.array(frontier_cells)
+        r_cells = 2.0 / self.grid_resolution
+        if not np.any(
+            (fc[:, 0] - cgc) ** 2 + (fc[:, 1] - cgr) ** 2 <= r_cells ** 2
+        ):
+            return False
+
+        cost, cell = self._point_path_cost(field, cgc, cgr)
+        if cell is None:
+            return False
+        if best_cost is not None and best_cost < self.goal_switch_margin * cost:
+            return False
+
+        path = self.grid.path_from_field(parent, cell[0], cell[1])
+        if path is None:
+            return False
+        gx, gy = self.grid.cell_to_world(cell[0], cell[1])
+        self.current_path = path
+        self.path_idx = 0
+        self._committed_goal = (gx, gy)
+        self._publish_path(path)
+        self._publish_goal_marker(gx, gy, r=0.0, g=1.0, b=0.0)
+        return True
+
+    # ---- euclidean goal selection (goal_selection:=euclidean) --------
+
+    def _select_goal_euclidean(self, requested, frontier_cells, clusters):
+        """Legacy selection: rank cluster centroids by straight-line
+        distance, then try them closest-first through retraction, the
+        connected-component filter and per-candidate A*."""
         def centroid_world(cluster):
             cc, cr = QuadtreeOccupancyGrid.cluster_centroid(cluster)
             return self.grid.cell_to_world(int(cc), int(cr))

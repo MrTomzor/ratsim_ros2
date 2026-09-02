@@ -610,6 +610,116 @@ class QuadtreeOccupancyGrid:
         self.last_astar_stats["reason"] = "exhausted"
         return None  # no path found
 
+    def dijkstra_field(
+        self,
+        start_wx: float,
+        start_wy: float,
+        inflation_radius: float = 2.0,
+        clearance: float = 0.0,
+        clearance_weight: float = 0.0,
+        max_expansions: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Single-source Dijkstra flood over known-FREE space.
+
+        Same traversability and edge costs as astar() — only inflated-FREE
+        cells are passable (unknown and occupied block), with the same
+        escape-set handling when the start sits inside the inflated band
+        and the same clearance penalty — but expands the whole reachable
+        region instead of racing to one goal.  One flood yields the exact
+        path cost from the start to EVERY reachable cell, so callers can
+        rank many candidate goals by path length instead of euclidean
+        distance and extract any path via path_from_field().
+
+        Returns (cost, parent):
+          cost:   float64 (cells_y, cells_x); path cost in cell units
+                  (orthogonal step 1.0, diagonal 1.414, plus clearance /
+                  escape penalties); np.inf where unreachable.
+          parent: int32 flat indices (row * cells_x + col) of each reached
+                  cell's predecessor; -1 = unreached; the start cell is
+                  its own parent.
+        """
+        grid = self.get_inflated_grid(inflation_radius)
+        prox = None
+        if clearance > 0.0 and clearance_weight > 0.0:
+            prox = self.get_proximity_cost(inflation_radius, clearance, clearance_weight)
+
+        cost = np.full((self.cells_y, self.cells_x), np.inf, dtype=np.float64)
+        parent = np.full((self.cells_y, self.cells_x), -1, dtype=np.int32)
+
+        sc, sr = self.world_to_cell(start_wx, start_wy)
+        if not self._in_bounds(sc, sr):
+            return cost, parent
+
+        # Same escape mechanism as astar(): if the start is inside the
+        # inflated band, raw-FREE cells nearby are passable (with a toll
+        # so paths leave the band as quickly as possible).
+        escape_set = set()
+        if grid[sr, sc] != FREE:
+            raw = self.to_flat_grid()
+            escape_r = int(math.ceil(inflation_radius / self.min_resolution)) + 1
+            for dr in range(-escape_r, escape_r + 1):
+                for dc in range(-escape_r, escape_r + 1):
+                    nc, nr = sc + dc, sr + dr
+                    if (self._in_bounds(nc, nr)
+                            and dc * dc + dr * dr <= escape_r * escape_r
+                            and raw[nr, nc] == FREE):
+                        escape_set.add((nc, nr))
+
+        neighbors = [
+            (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+            (-1, -1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (1, 1, 1.414),
+        ]
+
+        cost[sr, sc] = 0.0
+        parent[sr, sc] = sr * self.cells_x + sc
+        open_set = [(0.0, sc, sr)]
+        expansions = 0
+        while open_set:
+            g, cc, cr = heapq.heappop(open_set)
+            if g > cost[cr, cc]:
+                continue
+            expansions += 1
+            if max_expansions and expansions > max_expansions:
+                break
+            for dc, dr, step in neighbors:
+                nc, nr = cc + dc, cr + dr
+                if not self._in_bounds(nc, nr):
+                    continue
+                cell_val = grid[nr, nc]
+                if cell_val != FREE and (nc, nr) not in escape_set:
+                    continue
+                extra = 5.0 if cell_val == OCCUPIED else 0.0
+                if prox is not None:
+                    extra += prox[nr, nc]
+                ng = g + step + extra
+                if ng < cost[nr, nc]:
+                    cost[nr, nc] = ng
+                    parent[nr, nc] = cr * self.cells_x + cc
+                    heapq.heappush(open_set, (ng, nc, nr))
+        return cost, parent
+
+    def path_from_field(
+        self, parent: np.ndarray, goal_col: int, goal_row: int
+    ) -> Optional[List[Tuple[float, float]]]:
+        """Walk parent pointers from a dijkstra_field() back to the start.
+        Returns world-coordinate waypoints start->goal (same format as
+        astar()), or None if the goal was never reached."""
+        if not self._in_bounds(goal_col, goal_row):
+            return None
+        if parent[goal_row, goal_col] < 0:
+            return None
+        path = []
+        c, r = goal_col, goal_row
+        while True:
+            path.append(self.cell_to_world(c, r))
+            p = int(parent[r, c])
+            pc, pr = p % self.cells_x, p // self.cells_x
+            if (pc, pr) == (c, r):
+                break
+            c, r = pc, pr
+        path.reverse()
+        return path
+
     # ---- OccupancyGrid message export -------------------------------------
 
     def to_occupancy_grid_msg(self, frame_id: str = "odom", stamp=None):

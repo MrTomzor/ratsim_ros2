@@ -91,6 +91,7 @@ def launch_setup(context, *args, **kwargs):
                 "reward_lost_ticks": iarg("reward_lost_ticks"),
                 "reward_approach_dist": farg("reward_approach_dist"),
                 "goal_switch_margin": farg("goal_switch_margin"),
+                "goal_selection": LaunchConfiguration("goal_selection").perform(context),
                 "replan_interval": farg("replan_interval"),
                 "control_rate": farg("control_rate"),
                 "map_publish_interval": farg("map_publish_interval"),
@@ -138,6 +139,9 @@ def generate_launch_description():
             DeclareLaunchArgument("reward_lost_ticks", default_value="3"),
             DeclareLaunchArgument("reward_approach_dist", default_value="2.0"),
             DeclareLaunchArgument("goal_switch_margin", default_value="0.7"),
+            # "floodfill" = Dijkstra flood, cheapest path cost wins;
+            # "euclidean" = straight-line ranking + per-candidate A*
+            DeclareLaunchArgument("goal_selection", default_value="floodfill"),
             DeclareLaunchArgument("replan_interval", default_value="2.0"),
             DeclareLaunchArgument("control_rate", default_value="50.0"),
             DeclareLaunchArgument("map_publish_interval", default_value="0.5"),
