@@ -142,6 +142,9 @@ class QuadtreeOccupancyGrid:
         self._inflated_radius: float = -1.0
         self._prox_cache: Optional[np.ndarray] = None
         self._prox_key: tuple = ()
+        self._comp_cache: Optional[np.ndarray] = None
+        self._comp_radius: float = -1.0
+        self.last_astar_stats: dict = {}
 
     # ---- coordinate helpers -----------------------------------------------
 
@@ -173,6 +176,7 @@ class QuadtreeOccupancyGrid:
         self._flat_cache = None
         self._inflated_cache = None
         self._prox_cache = None
+        self._comp_cache = None
         self._set_recursive(self._root, wx, wy, value)
 
     def _set_recursive(self, node: _QuadNode, wx: float, wy: float, value: int):
@@ -207,6 +211,7 @@ class QuadtreeOccupancyGrid:
         self._flat_cache = None
         self._inflated_cache = None
         self._prox_cache = None
+        self._comp_cache = None
 
         cos_yaw = math.cos(agent_yaw)
         sin_yaw = math.sin(agent_yaw)
@@ -339,6 +344,23 @@ class QuadtreeOccupancyGrid:
         self._prox_key = key
         return self._prox_cache
 
+    def get_free_components(self, inflation_radius: float) -> np.ndarray:
+        """Label the 8-connected components of inflated-FREE space.
+
+        Returns an int array (cells_y, cells_x): 0 = not free, 1..N =
+        component id.  Two cells share an id iff A* (which blocks unknown
+        and occupied) can travel between them, so candidate goals in a
+        different component than the agent are provably unreachable and can
+        be skipped without running A* at all."""
+        if self._comp_cache is not None and self._comp_radius == inflation_radius:
+            return self._comp_cache
+        from scipy.ndimage import label
+        grid = self.get_inflated_grid(inflation_radius)
+        labels, _ = label(grid == FREE, structure=np.ones((3, 3), dtype=int))
+        self._comp_cache = labels
+        self._comp_radius = inflation_radius
+        return labels
+
     # ---- frontier detection -----------------------------------------------
 
     def get_frontier_cells(self) -> List[Tuple[int, int]]:
@@ -417,16 +439,19 @@ class QuadtreeOccupancyGrid:
     ) -> Optional[List[Tuple[float, float]]]:
         """A* on the inflated grid. Returns list of (wx, wy) waypoints or None.
 
-        If the start cell is inside the inflated zone (robot pushed into wall),
-        the search is allowed to expand from occupied cells near the start so
-        the robot can escape.  With clearance > 0, cells within `clearance`
-        meters of an inflated obstacle cost up to `clearance_weight` extra,
-        so paths prefer corridor centerlines.
+        Only known-FREE cells are traversable — unknown space is blocked, so
+        paths never cut through unmapped territory (frontier goals sit on the
+        known side of the boundary, so they stay reachable).  If the start
+        cell is inside the inflated zone (robot pushed toward a wall), cells
+        near the start that are free on the RAW grid are passable so the
+        robot can escape the inflated band — but never through actual
+        occupancy.  With clearance > 0, cells within `clearance` meters of an
+        inflated obstacle cost up to `clearance_weight` extra, so paths
+        prefer corridor centerlines.
 
-        Unknown cells are traversable, so an unreachable goal would flood the
-        entire unexplored world; the search is therefore confined to the
-        observed region's bounding box (+search_margin meters) and gives up
-        after max_expansions pops (0 = unlimited).
+        The observed-bbox confinement (+search_margin meters) and the
+        max_expansions cap (0 = unlimited) remain as insurance against
+        pathological searches.
         """
         grid = self.get_inflated_grid(inflation_radius)
         prox = None
@@ -435,9 +460,19 @@ class QuadtreeOccupancyGrid:
         sc, sr = self.world_to_cell(start_wx, start_wy)
         gc, gr = self.world_to_cell(goal_wx, goal_wy)
 
+        # Diagnostics for the caller (why did this search fail?)
+        self.last_astar_stats = {
+            "expansions": 0, "cap_hit": False, "reason": "",
+            "start_inflated_val": None, "goal_val": None,
+        }
+
         if not self._in_bounds(sc, sr) or not self._in_bounds(gc, gr):
+            self.last_astar_stats["reason"] = "out_of_bounds"
             return None
-        if grid[gr, gc] == OCCUPIED:
+        self.last_astar_stats["start_inflated_val"] = int(grid[sr, sc])
+        self.last_astar_stats["goal_val"] = int(grid[gr, gc])
+        if grid[gr, gc] != FREE:
+            self.last_astar_stats["reason"] = "goal_not_free"
             return None
 
         # Search-region bounding box: observed cells + margin (always
@@ -454,16 +489,20 @@ class QuadtreeOccupancyGrid:
             row_lo, col_lo = 0, 0
             row_hi, col_hi = self.cells_y - 1, self.cells_x - 1
 
-        # If start is in inflated zone, allow escaping: mark cells within a
-        # small radius of the start as passable.
-        start_in_obstacle = grid[sr, sc] == OCCUPIED
+        # If start is in inflated zone, allow escaping: cells near the start
+        # that are free on the RAW grid are passable (inflated-but-free only —
+        # never real walls, never unknown).
+        start_in_obstacle = grid[sr, sc] != FREE
         escape_set = set()
         if start_in_obstacle:
+            raw = self.to_flat_grid()
             escape_r = int(math.ceil(inflation_radius / self.min_resolution)) + 1
             for dr in range(-escape_r, escape_r + 1):
                 for dc in range(-escape_r, escape_r + 1):
                     nc, nr = sc + dc, sr + dr
-                    if self._in_bounds(nc, nr) and dc * dc + dr * dr <= escape_r * escape_r:
+                    if (self._in_bounds(nc, nr)
+                            and dc * dc + dr * dr <= escape_r * escape_r
+                            and raw[nr, nc] == FREE):
                         escape_set.add((nc, nr))
 
         # 8-connected neighbors with costs
@@ -484,9 +523,14 @@ class QuadtreeOccupancyGrid:
             f, g, cc, cr = heapq.heappop(open_set)
             expansions += 1
             if max_expansions and expansions > max_expansions:
+                self.last_astar_stats["expansions"] = expansions
+                self.last_astar_stats["cap_hit"] = True
+                self.last_astar_stats["reason"] = "expansion_cap"
                 return None
 
             if cc == gc and cr == gr:
+                self.last_astar_stats["expansions"] = expansions
+                self.last_astar_stats["reason"] = "found"
                 # Reconstruct path
                 path = []
                 node = (gc, gr)
@@ -509,10 +553,10 @@ class QuadtreeOccupancyGrid:
                 if not (col_lo <= nc <= col_hi and row_lo <= nr <= row_hi):
                     continue
                 cell_val = grid[nr, nc]
-                if cell_val == OCCUPIED and (nc, nr) not in escape_set:
+                if cell_val != FREE and (nc, nr) not in escape_set:
                     continue
-                # Allow traversal through unknown — we'll replan if we discover obstacles
-                # Add penalty for traversing inflated cells to prefer clear paths
+                # Penalty for traversing inflated escape cells so the path
+                # leaves the inflated band as quickly as possible
                 extra_cost = 5.0 if cell_val == OCCUPIED else 0.0
                 if prox is not None:
                     extra_cost += prox[nr, nc]
@@ -522,6 +566,8 @@ class QuadtreeOccupancyGrid:
                     came_from[(nc, nr)] = (cc, cr)
                     heapq.heappush(open_set, (ng + heuristic(nc, nr), ng, nc, nr))
 
+        self.last_astar_stats["expansions"] = expansions
+        self.last_astar_stats["reason"] = "exhausted"
         return None  # no path found
 
     # ---- OccupancyGrid message export -------------------------------------
@@ -565,3 +611,4 @@ class QuadtreeOccupancyGrid:
         self._flat_cache = None
         self._inflated_cache = None
         self._prox_cache = None
+        self._comp_cache = None

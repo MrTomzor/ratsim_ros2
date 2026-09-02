@@ -150,6 +150,8 @@ class ForagingExplorer(Node):
         self._n_goals_reached = 0
         self._n_reflex_backups = 0
         self._last_dbg_time = 0.0
+        self._fail_details: list[str] = []
+        self._stuck_dumped = False
 
         # -- QoS for latched topics --
         latched_qos = QoSProfile(
@@ -253,6 +255,7 @@ class ForagingExplorer(Node):
                 self._n_goals_reached = 0
                 self._n_reflex_backups = 0
                 self._last_dbg_time = 0.0
+                self._stuck_dumped = False
                 self.state = State.EXPLORE
                 self._replan_requested = True
             else:
@@ -529,14 +532,51 @@ class ForagingExplorer(Node):
         # nothing and would loop plan->reached->plan forever in place.
         min_goal_dist = self.goal_reached_dist + self.min_lookahead
 
+        # Reachability filter: candidates outside the agent's connected
+        # component of known-free space are unreachable (A* blocks unknown),
+        # e.g. free-cell islands leaked behind walls.  Skipping them here
+        # keeps them from burning the A*-failure budget every cycle.
+        comp_labels = self.grid.get_free_components(self.inflation_radius)
+        a_col, a_row = self.grid.world_to_cell(self.agent_x, self.agent_y)
+        agent_comp = 0
+        if self.grid._in_bounds(a_col, a_row):
+            agent_comp = int(comp_labels[a_row, a_col])
+        if agent_comp == 0:
+            # Agent sits in the inflated band (or an unscanned cell) — use
+            # the nearest free cell's component, mirroring the A* escape set.
+            esc = int(math.ceil(self.inflation_radius / self.grid_resolution)) + 1
+            best_d2 = None
+            for dr in range(-esc, esc + 1):
+                for dc in range(-esc, esc + 1):
+                    c, r = a_col + dc, a_row + dr
+                    d2 = dr * dr + dc * dc
+                    if (d2 <= esc * esc and self.grid._in_bounds(c, r)
+                            and comp_labels[r, c] != 0
+                            and (best_d2 is None or d2 < best_d2)):
+                        best_d2 = d2
+                        agent_comp = int(comp_labels[r, c])
+
         path = None
         goal_x = goal_y = 0.0
         n_too_close = 0
         n_astar_fails = 0
+        n_unretractable = 0
+        n_islands = 0
+        self._fail_details = []
         for raw_gx, raw_gy in candidates:
             # Retract the goal off the free/unknown boundary into known-free,
             # non-inflated space so the last stretch doesn't aim at a wall.
-            goal_x, goal_y = self._retract_goal(raw_gx, raw_gy)
+            retracted = self._retract_goal(raw_gx, raw_gy)
+            if retracted is None:
+                n_unretractable += 1
+                path = None
+                continue
+            goal_x, goal_y = retracted
+            g_col, g_row = self.grid.world_to_cell(goal_x, goal_y)
+            if agent_comp == 0 or int(comp_labels[g_row, g_col]) != agent_comp:
+                n_islands += 1
+                path = None
+                continue
             if math.hypot(goal_x - self.agent_x, goal_y - self.agent_y) < min_goal_dist:
                 n_too_close += 1
                 path = None
@@ -552,6 +592,13 @@ class ForagingExplorer(Node):
                 # Capped/unreachable goals are expensive — give up this cycle
                 # after a few and retry on the replan interval.
                 n_astar_fails += 1
+                st = self.grid.last_astar_stats
+                self._fail_details.append(
+                    f"goal=({goal_x:.0f},{goal_y:.0f}) "
+                    f"d={math.hypot(goal_x - self.agent_x, goal_y - self.agent_y):.0f}m "
+                    f"{st.get('reason')} exp={st.get('expansions')} "
+                    f"sval={st.get('start_inflated_val')}"
+                )
                 if n_astar_fails >= 4:
                     break
             if path is not None:
@@ -566,8 +613,11 @@ class ForagingExplorer(Node):
             self._n_plan_failures += 1
             self.get_logger().info(
                 f"No plan: {len(candidates)} clusters "
-                f"({n_too_close} within {min_goal_dist:.1f}m, rest unreachable)."
+                f"({n_too_close} within {min_goal_dist:.1f}m, "
+                f"{n_unretractable} unretractable, {n_islands} islands, "
+                f"rest unreachable). " + "; ".join(self._fail_details)
             )
+            self._dump_stuck_state(candidates)
             self.current_path = []
             return
 
@@ -585,11 +635,36 @@ class ForagingExplorer(Node):
         self._publish_frontiers(clusters)
         self._publish_goal_marker(goal_x, goal_y, r=0.0, g=1.0, b=0.0)
 
-    def _retract_goal(self, gx: float, gy: float) -> tuple[float, float]:
+    def _dump_stuck_state(self, candidates) -> None:
+        """One-shot per episode: save the grid + candidates when a planning
+        cycle fails completely, for offline analysis."""
+        if self._stuck_dumped:
+            return
+        self._stuck_dumped = True
+        try:
+            import os
+            out_dir = os.environ.get("RATSIM_DEBUG_DIR", "/tmp")
+            path = os.path.join(out_dir, f"stuck_dump_{int(time.time())}.npz")
+            np.savez_compressed(
+                path,
+                flat=self.grid.to_flat_grid(),
+                inflated=self.grid.get_inflated_grid(self.inflation_radius),
+                agent=np.array([self.agent_x, self.agent_y]),
+                candidates=np.array(candidates, dtype=np.float64),
+                origin=np.array([self.grid.origin_x, self.grid.origin_y]),
+                resolution=np.array([self.grid.min_resolution]),
+            )
+            self.get_logger().info(f"Stuck-state dump written: {path}")
+        except Exception as e:  # debug aid only — never kill planning
+            self.get_logger().warn(f"Stuck-state dump failed: {e}")
+
+    def _retract_goal(self, gx: float, gy: float) -> tuple[float, float] | None:
         """Move a frontier goal into known-free, non-inflated space.
 
         Steps from the goal toward the agent; if that fails, scans a small
-        box around the goal. Falls back to the original point."""
+        box around the goal. Returns None if no known-free, non-inflated
+        cell is found — A* blocks unknown cells, so planning to such a goal
+        would be a guaranteed failure."""
         inflated = self.grid.get_inflated_grid(self.inflation_radius)
 
         def ok(wx, wy):
@@ -629,7 +704,7 @@ class ForagingExplorer(Node):
                     best = (c, r)
         if best is not None:
             return self.grid.cell_to_world(best[0], best[1])
-        return gx, gy
+        return None
 
     # ------------------------------------------------------------------
     # Control loop (fast timer) — pure pursuit path following
