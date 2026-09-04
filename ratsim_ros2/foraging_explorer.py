@@ -63,9 +63,11 @@ class ForagingExplorer(Node):
         super().__init__("foraging_explorer")
 
         # -- Parameters --
-        self.declare_parameter("grid_resolution", 1.0)
-        self.declare_parameter("inflation_radius", 2.0)
-        self.declare_parameter("reward_descriptor_index", 2)
+        self.declare_parameter("grid_resolution", 0.3)
+        self.declare_parameter("inflation_radius", 0.4)
+        # 0 = reward_obj1 in the default agent preset's
+        # reward_and_boundary_only semantic set
+        self.declare_parameter("reward_descriptor_index", 0)
         self.declare_parameter("descriptor_dimension", 3)
         self.declare_parameter("max_linear_vel", 10.0)
         # 1.5 matches the RL agent's limit (gym env.py) for a fair comparison
@@ -250,9 +252,10 @@ class ForagingExplorer(Node):
     def _world_bounds_cb(self, msg: Float32MultiArray):
         if len(msg.data) < 2:
             return
-        w, h = msg.data[0], msg.data[1]
-        self.get_logger().info(f"Received world bounds: {w} x {h}")
-        self._init_grid(w * 2, h * 2) # agent might not start at center of world, so make grid bigger
+        # /world_bounds carries [x_extent, y_extent] in the ROS frame
+        x_extent, y_extent = msg.data[0], msg.data[1]
+        self.get_logger().info(f"Received world bounds: x={x_extent} y={y_extent}")
+        self._init_grid(x_extent * 2, y_extent * 2) # agent might not start at center of world, so make grid bigger
 
     def _init_grid(self, width: float, height: float):
         self.world_width = width

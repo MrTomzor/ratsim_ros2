@@ -112,16 +112,22 @@ def generate_launch_description():
             DeclareLaunchArgument("task_config_json", default_value=""),
             DeclareLaunchArgument("world_preset", default_value="default"),
             DeclareLaunchArgument("agent_preset", default_value="sphereagent_2d_lidar"),
-            DeclareLaunchArgument("task_preset", default_value="default"),
+            DeclareLaunchArgument(
+                "task_preset",
+                default_value="volumetric_exploration_5000_collision_penalty",
+            ),
             DeclareLaunchArgument("scene_name", default_value="Wildfire"),
-            DeclareLaunchArgument("seeds", default_value="1,2,3,4,5,6,7,8,9,10"),
+            DeclareLaunchArgument("seeds", default_value="1"),
             DeclareLaunchArgument("episodes_per_seed", default_value="1"),
-            DeclareLaunchArgument("rtf", default_value="1.0"),
+            # 0 = unthrottled; pass rtf:=1.0 to watch in real time
+            DeclareLaunchArgument("rtf", default_value="0.0"),
             DeclareLaunchArgument("lockstep", default_value="true"),
             # Explorer parameters (defaults match the node's declare_parameter defaults)
-            DeclareLaunchArgument("grid_resolution", default_value="1.0"),
-            DeclareLaunchArgument("inflation_radius", default_value="2.0"),
-            DeclareLaunchArgument("reward_descriptor_index", default_value="2"),
+            DeclareLaunchArgument("grid_resolution", default_value="0.3"),
+            DeclareLaunchArgument("inflation_radius", default_value="0.4"),
+            # 0 = reward_obj1 in the default agent preset's
+            # reward_and_boundary_only semantic set
+            DeclareLaunchArgument("reward_descriptor_index", default_value="0"),
             DeclareLaunchArgument("descriptor_dimension", default_value="3"),
             DeclareLaunchArgument("max_linear_vel", default_value="10.0"),
             DeclareLaunchArgument("max_angular_vel", default_value="1.5"),

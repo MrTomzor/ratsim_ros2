@@ -74,12 +74,12 @@ class UnityRos2Bridge(Node):
         self.declare_parameter("task_config_json", "")
         self.declare_parameter("world_preset", "default")
         self.declare_parameter("agent_preset", "sphereagent_2d_lidar")
-        self.declare_parameter("task_preset", "default")
+        self.declare_parameter("task_preset", "volumetric_exploration_5000_collision_penalty")
         self.declare_parameter("scene_name", "Wildfire")
-        self.declare_parameter("seeds", "1,2,3,4,5,6,7,8,9,10")
+        self.declare_parameter("seeds", "1")
         self.declare_parameter("episodes_per_seed", 1)
         self.declare_parameter("episode_max_steps", 2000)
-        self.declare_parameter("rtf", 1.0)          # real-time factor (0 = unlimited)
+        self.declare_parameter("rtf", 0.0)          # real-time factor (0 = unlimited)
         # Unity physics step per tick — must match physicsStepTime serialized
         # in SERVER.prefab (0.1), NOT the RoslikeTCPServer.cs field default.
         self.declare_parameter("physics_dt", 0.1)
@@ -303,12 +303,18 @@ class UnityRos2Bridge(Node):
     # ------------------------------------------------------------------
 
     def _publish_world_bounds(self):
+        # Config width spans Unity x, height spans Unity z. In the ROS
+        # frame (CoordConversion: ROS x = Unity z, ROS y = -Unity x) the
+        # map's x-extent is therefore the config HEIGHT and its y-extent
+        # the config WIDTH. Publish [x_extent, y_extent] in ROS frame.
         w = float(self.world_config.get("world_bounds/width", 2000))
         h = float(self.world_config.get("world_bounds/height", 2000))
         msg = Float32MultiArray()
-        msg.data = [w, h]
+        msg.data = [h, w]
         self.pub_world_bounds.publish(msg)
-        self.get_logger().info(f"Published world bounds: {w} x {h}")
+        self.get_logger().info(
+            f"Published world bounds (ROS frame): x_extent={h} y_extent={w}"
+        )
 
     # ------------------------------------------------------------------
     # Cmd vel callback
