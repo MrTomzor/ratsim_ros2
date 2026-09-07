@@ -113,6 +113,13 @@ class ForagingExplorer(Node):
         # of wall timers, and answer every step with /cmd_vel_stamped so the
         # sim waits for the command. replan_interval then counts SIM seconds.
         self.declare_parameter("lockstep", True)
+        # Declare the run finished after this many seconds (sim seconds in
+        # lockstep, wall seconds in free mode) without any plan or reward to
+        # chase — e.g. every frontier explored or unreachable. The bridge ends
+        # the episode on the resulting /explorer_done. 0 disables. Replanning
+        # continues meanwhile, so a dynamic blocker that clears resets the
+        # timer.
+        self.declare_parameter("stuck_timeout", 10.0)
 
         self.grid_resolution = self.get_parameter("grid_resolution").value
         self.inflation_radius = self.get_parameter("inflation_radius").value
@@ -133,6 +140,7 @@ class ForagingExplorer(Node):
         self.map_publish_interval = self.get_parameter("map_publish_interval").value
         self.safety_dist = self.get_parameter("safety_dist").value
         self.pure_rotation_threshold = self.get_parameter("pure_rotation_threshold").value
+        self.stuck_timeout = self.get_parameter("stuck_timeout").value
         self.reward_lost_ticks = self.get_parameter("reward_lost_ticks").value
         self.reward_approach_dist = self.get_parameter("reward_approach_dist").value
         self.goal_switch_margin = self.get_parameter("goal_switch_margin").value
@@ -194,6 +202,9 @@ class ForagingExplorer(Node):
         self._last_dbg_time = 0.0
         self._fail_details: list[str] = []
         self._stuck_dumped = False
+        # Stuck detection: time of the last tick that had a plan / reward
+        self._last_progress_time: float | None = None
+        self._stuck_reported = False
 
         # -- QoS for latched topics --
         latched_qos = QoSProfile(
@@ -221,6 +232,7 @@ class ForagingExplorer(Node):
         self.pub_frontiers = self.create_publisher(MarkerArray, "/frontiers", 10)
         self.pub_goal = self.create_publisher(Marker, "/goal_marker", 10)
         self.pub_carrot = self.create_publisher(Marker, "/carrot_marker", 10)
+        self.pub_done = self.create_publisher(Bool, "/explorer_done", 10)
 
         if self.lockstep:
             # Event-driven: one plan/control update per sim tick, answered
@@ -300,6 +312,8 @@ class ForagingExplorer(Node):
                 self._n_reflex_backups = 0
                 self._last_dbg_time = 0.0
                 self._stuck_dumped = False
+                self._last_progress_time = None
+                self._stuck_reported = False
                 self._reward_world = None
                 self._reward_missed_ticks = 0
                 self._latest_descriptors = None
@@ -593,6 +607,30 @@ class ForagingExplorer(Node):
                 or now - self._last_plan_time >= self.replan_interval):
             self._last_plan_time = now
             self._planning_loop()
+        self._check_stuck(now)
+
+    def _check_stuck(self, now: float):
+        """Publish /explorer_done once nothing has been plannable for
+        stuck_timeout seconds. Any tick with a path, or in COLLECT, counts
+        as progress and resets the timer."""
+        if self.stuck_timeout <= 0 or self._stuck_reported:
+            return
+        active = self.state != State.EXPLORE or bool(self.current_path)
+        if active or self._last_progress_time is None:
+            self._last_progress_time = now
+            return
+        idle = now - self._last_progress_time
+        if idle < self.stuck_timeout:
+            return
+        self._stuck_reported = True
+        self.get_logger().warn(
+            f"STUCK: no plan for {idle:.1f}s (>= stuck_timeout={self.stuck_timeout:.1f}s) "
+            f"— plans={self._n_plans} fails={self._n_plan_failures} "
+            f"obj={self._objects_collected}; publishing /explorer_done"
+        )
+        msg = Bool()
+        msg.data = True
+        self.pub_done.publish(msg)
 
     def _planning_loop(self):
         """Detect frontiers, plan A* path."""

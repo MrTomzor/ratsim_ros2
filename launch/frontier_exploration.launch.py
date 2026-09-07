@@ -92,6 +92,7 @@ def launch_setup(context, *args, **kwargs):
                 "reward_approach_dist": farg("reward_approach_dist"),
                 "goal_switch_margin": farg("goal_switch_margin"),
                 "goal_selection": LaunchConfiguration("goal_selection").perform(context),
+                "stuck_timeout": farg("stuck_timeout"),
                 "replan_interval": farg("replan_interval"),
                 "control_rate": farg("control_rate"),
                 "map_publish_interval": farg("map_publish_interval"),
@@ -148,6 +149,10 @@ def generate_launch_description():
             # "floodfill" = Dijkstra flood, cheapest path cost wins;
             # "euclidean" = straight-line ranking + per-candidate A*
             DeclareLaunchArgument("goal_selection", default_value="floodfill"),
+            # Seconds without any plan/reward before the explorer declares the
+            # run done and the bridge ends the episode (reason explorer_stuck).
+            # 0 disables.
+            DeclareLaunchArgument("stuck_timeout", default_value="10.0"),
             DeclareLaunchArgument("replan_interval", default_value="2.0"),
             DeclareLaunchArgument("control_rate", default_value="50.0"),
             DeclareLaunchArgument("map_publish_interval", default_value="0.5"),

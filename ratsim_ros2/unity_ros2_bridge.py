@@ -28,6 +28,7 @@ Services:
 """
 
 import json
+from collections import Counter
 import sys
 import math
 import threading
@@ -79,6 +80,9 @@ class UnityRos2Bridge(Node):
         self.declare_parameter("seeds", "1")
         self.declare_parameter("episodes_per_seed", 1)
         self.declare_parameter("episode_max_steps", 2000)
+        # End the episode when the explorer publishes /explorer_done (it gave
+        # up: no plan for its stuck_timeout). Termination reason "explorer_stuck".
+        self.declare_parameter("terminate_on_explorer_done", True)
         self.declare_parameter("rtf", 0.0)          # real-time factor (0 = unlimited)
         # Unity physics step per tick — must match physicsStepTime serialized
         # in SERVER.prefab (0.1), NOT the RoslikeTCPServer.cs field default.
@@ -120,6 +124,7 @@ class UnityRos2Bridge(Node):
         self.seeds = [int(s.strip()) for s in seeds_str.split(",")]
         self.episodes_per_seed = self.get_parameter("episodes_per_seed").value
         self.episode_max_steps_param = self.get_parameter("episode_max_steps").value
+        self.terminate_on_explorer_done = self.get_parameter("terminate_on_explorer_done").value
         self.rtf = self.get_parameter("rtf").value
         self.physics_dt = self.get_parameter("physics_dt").value
         self.lockstep = self.get_parameter("lockstep").value
@@ -176,6 +181,7 @@ class UnityRos2Bridge(Node):
             angular_x=0.0, angular_y=0.0, angular_z=0.0,
         )
         self.create_subscription(Twist, "/cmd_vel", self._cmd_vel_cb, 10)
+        self.create_subscription(Bool, "/explorer_done", self._explorer_done_cb, 10)
 
         # Lockstep handshake: the awaited reply IS the command, so there is no
         # race between "ack arrived" and "cmd_vel arrived".
@@ -197,6 +203,7 @@ class UnityRos2Bridge(Node):
         self._all_done = False
         self._needs_reset = True  # start by resetting the first episode
         self._episode_results: list[dict] = []  # for the end-of-run summary
+        self._explorer_done = False
         self._stop_event = threading.Event()  # for clean shutdown
 
         # -- Sim loop runs on a dedicated thread so it doesn't starve the
@@ -255,9 +262,21 @@ class UnityRos2Bridge(Node):
 
             # Check termination
             terminated = self.task_tracker.is_terminated()
+            explorer_done = self.terminate_on_explorer_done and self._explorer_done
             truncated = self.sim_step >= self.task_tracker.episode_max_steps
 
-            if terminated or truncated:
+            if terminated or truncated or explorer_done:
+                if terminated:
+                    reason = self.task_tracker.get_termination_reason()
+                elif explorer_done:
+                    reason = "explorer_stuck"
+                    self.get_logger().warn(
+                        f"Episode ended EARLY at step {self.sim_step}: "
+                        f"explorer reported stuck (/explorer_done) — "
+                        f"no reachable frontier or reward left."
+                    )
+                else:
+                    reason = "max_steps"
                 self.episode_active = False
                 active_msg = Bool()
                 active_msg.data = False
@@ -271,12 +290,8 @@ class UnityRos2Bridge(Node):
                     "total_score": self.task_tracker.get_total_score(),
                     "objects_found": self.task_tracker.get_num_reward_objs_picked_up(),
                     "collisions": self.task_tracker.get_collision_count(),
-                    "termination_reason": (
-                        self.task_tracker.get_termination_reason()
-                        if terminated
-                        else "max_steps"
-                    ),
-                    "terminated": terminated,
+                    "termination_reason": reason,
+                    "terminated": terminated or explorer_done,
                     "truncated": truncated,
                 }
                 # JSON line to stdout for test.py
@@ -310,11 +325,13 @@ class UnityRos2Bridge(Node):
         pickups = [r["objects_found"] for r in results]
         scores = [r["total_score"] for r in results]
         n = len(results)
+        reasons = Counter(r["termination_reason"] for r in results)
+        reasons_str = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items()))
         self.get_logger().info(
             f"Summary over {n} runs: rew pickups min={min(pickups)} "
             f"max={max(pickups)} avg={sum(pickups) / n:.2f} | "
             f"score min={min(scores):.2f} max={max(scores):.2f} "
-            f"avg={sum(scores) / n:.2f}"
+            f"avg={sum(scores) / n:.2f} | ended by: {reasons_str}"
         )
 
     # ------------------------------------------------------------------
@@ -338,6 +355,9 @@ class UnityRos2Bridge(Node):
     # ------------------------------------------------------------------
     # Cmd vel callback
     # ------------------------------------------------------------------
+
+    def _explorer_done_cb(self, msg: Bool):
+        self._explorer_done = bool(msg.data)
 
     def _cmd_vel_cb(self, msg: Twist):
         if self.lockstep:
@@ -425,6 +445,7 @@ class UnityRos2Bridge(Node):
 
         self.task_tracker.reset()
         self.sim_step = 0
+        self._explorer_done = False
 
         # Reset cmd_vel to zero
         self.latest_cmd_vel = TwistMessage(
