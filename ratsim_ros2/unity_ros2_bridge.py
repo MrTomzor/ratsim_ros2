@@ -196,6 +196,7 @@ class UnityRos2Bridge(Node):
         self._ep_idx = 0
         self._all_done = False
         self._needs_reset = True  # start by resetting the first episode
+        self._episode_results: list[dict] = []  # for the end-of-run summary
         self._stop_event = threading.Event()  # for clean shutdown
 
         # -- Sim loop runs on a dedicated thread so it doesn't starve the
@@ -280,10 +281,12 @@ class UnityRos2Bridge(Node):
                 }
                 # JSON line to stdout for test.py
                 print(json.dumps(result), flush=True)
+                self._episode_results.append(result)
+                run_idx = len(self._episode_results)
                 self.get_logger().info(
-                    f"Episode done: seed={seed}, steps={self.sim_step}, "
-                    f"objects={result['objects_found']}, "
-                    f"score={result['total_score']:.2f}, "
+                    f"run {run_idx} (seed={seed}, ep={self._ep_idx}): "
+                    f"{result['objects_found']} rew pickups, "
+                    f"score={result['total_score']:.2f}, steps={self.sim_step}, "
                     f"reason={result['termination_reason']}"
                 )
 
@@ -294,9 +297,25 @@ class UnityRos2Bridge(Node):
                     self._seed_idx += 1
                     if self._seed_idx >= len(self.seeds):
                         self.get_logger().info("All episodes complete.")
+                        self._log_summary()
                         self._all_done = True
                         return
                 self._needs_reset = True
+
+    def _log_summary(self):
+        """Log min / max / avg reward pickups over all finished episodes."""
+        results = self._episode_results
+        if not results:
+            return
+        pickups = [r["objects_found"] for r in results]
+        scores = [r["total_score"] for r in results]
+        n = len(results)
+        self.get_logger().info(
+            f"Summary over {n} runs: rew pickups min={min(pickups)} "
+            f"max={max(pickups)} avg={sum(pickups) / n:.2f} | "
+            f"score min={min(scores):.2f} max={max(scores):.2f} "
+            f"avg={sum(scores) / n:.2f}"
+        )
 
     # ------------------------------------------------------------------
     # World bounds
